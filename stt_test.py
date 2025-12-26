@@ -111,7 +111,7 @@ class STTLoadTester:
     async def _make_request(self, request_id: int, is_warmup: bool = False) -> TestResult:
         """단일 요청 실행 (오디오 생성 시간 제외)"""
         # 오디오 생성 (시간 측정 제외)
-        audio_data = self.audio_generator_func()
+        audio_data = self.audio_generator_func(is_warmup=is_warmup)
         
         # 오디오 샘플 저장
         request_type = "warmup" if is_warmup else "performance"
@@ -662,12 +662,81 @@ def generate_speech_like_audio(duration_seconds: float = 10.0, sample_rate: int 
     except Exception as e:
         raise ValueError(f"WAV 파일 생성 중 오류: {e}")
 
+
+def load_audio_from_file(file_path: str) -> io.BytesIO:
+    """
+    파일에서 오디오 데이터를 읽어서 BytesIO 객체로 반환
+    
+    Args:
+        file_path: 오디오 파일 경로
+    
+    Returns:
+        오디오 데이터를 담은 BytesIO 객체
+    """
+    try:
+        with open(file_path, 'rb') as f:
+            audio_bytes = f.read()
+        
+        audio_buffer = io.BytesIO(audio_bytes)
+        audio_buffer.seek(0)
+        return audio_buffer
+    except FileNotFoundError:
+        raise FileNotFoundError(f"오디오 파일을 찾을 수 없습니다: {file_path}")
+    except Exception as e:
+        raise ValueError(f"오디오 파일 읽기 중 오류: {e}")
+
+
+def get_all_audio_files(folder_path: str) -> List[str]:
+    """
+    폴더에서 모든 오디오 파일 목록을 가져옴
+    
+    Args:
+        folder_path: 오디오 파일이 있는 폴더 경로
+    
+    Returns:
+        오디오 파일 전체 경로 리스트 (정렬됨)
+    """
+    if not os.path.exists(folder_path):
+        raise FileNotFoundError(f"폴더를 찾을 수 없습니다: {folder_path}")
+    
+    # 지원하는 오디오 파일 확장자
+    audio_extensions = ['.wav', '.mp3', '.m4a', '.flac', '.ogg', '.wma']
+    
+    # 폴더 내의 모든 오디오 파일 찾기
+    audio_files = []
+    for file in os.listdir(folder_path):
+        file_path = os.path.join(folder_path, file)
+        if os.path.isfile(file_path):
+            _, ext = os.path.splitext(file.lower())
+            if ext in audio_extensions:
+                audio_files.append(file_path)
+    
+    if not audio_files:
+        raise ValueError(f"폴더에 오디오 파일이 없습니다: {folder_path}")
+    
+    # 파일명으로 정렬하여 일관된 순서 보장
+    audio_files.sort()
+    return audio_files
+
+
 # HTTP STT API 호출 함수
-async def http_stt_call(audio_data: io.BytesIO, base_url: str, endpoint: str):
+async def http_stt_call(audio_data: io.BytesIO, base_url: str, endpoint: str, filename: str = 'audio.wav'):
     """HTTP STT API 호출"""
     import aiohttp
     
     url = f"{base_url}{endpoint}"
+    
+    # 파일 확장자에 따른 content_type 결정
+    _, ext = os.path.splitext(filename.lower())
+    content_type_map = {
+        '.wav': 'audio/wav',
+        '.mp3': 'audio/mpeg',
+        '.m4a': 'audio/mp4',
+        '.flac': 'audio/flac',
+        '.ogg': 'audio/ogg',
+        '.wma': 'audio/x-ms-wma'
+    }
+    content_type = content_type_map.get(ext, 'audio/wav')
     
     async with aiohttp.ClientSession() as session:
         # BytesIO를 바이트 데이터로 읽기
@@ -676,7 +745,7 @@ async def http_stt_call(audio_data: io.BytesIO, base_url: str, endpoint: str):
         
         data = aiohttp.FormData()
         # 바이트 데이터를 파일로 전송
-        data.add_field('file', audio_bytes, filename='audio.wav', content_type='audio/wav')
+        data.add_field('file', audio_bytes, filename=filename, content_type=content_type)
         # 필요시 추가 필드 (예: model, language 등)
         # data.add_field('model', 'whisper-1')
         
@@ -733,41 +802,130 @@ async def main():
         return
     
     # 설정 값 추출 (기본값 포함)
-    total_requests = config.get("total_requests", 100)
-    warmup_requests = config.get("warmup_requests", 10)
     concurrent_requests = config.get("concurrent_requests", 5)
     request_delay = config.get("request_delay", 0.0)
-    audio_duration = config.get("audio_duration", 10.0)
-    sample_rate = config.get("sample_rate", 16000)
+    use_random_audio = config.get("use_random_audio", True)
     save_audio_samples = config.get("save_audio_samples", False)
     save_path = config.get("save_path", None)
     base_url = config.get("api", {}).get("base_url", "http://192.168.73.172:8000")
     endpoint = config.get("api", {}).get("endpoint", "/v1/audio/transcriptions")
     
-    # 유효성 검사
-    if warmup_requests >= total_requests:
-        print("❌ 오류: warmup_requests는 total_requests보다 작아야 합니다.")
-        return
+    # 랜덤 오디오 설정 (use_random_audio가 true일 때만 사용)
+    random_audio_config = config.get("random_audio", {})
+    total_requests = random_audio_config.get("total_requests", 100)
+    warmup_requests = random_audio_config.get("warmup_requests", 10)
+    audio_duration = random_audio_config.get("audio_duration", 10.0)
+    sample_rate = random_audio_config.get("sample_rate", 16000)
+    
+    # Resource 폴더 설정 (use_random_audio가 false일 때 사용)
+    resource_config = config.get("resource", {})
+    resource_base_path = resource_config.get("base_path", "resource")
+    resource_warmup_folder = resource_config.get("warmup_folder", "warm_up")
+    resource_test_folder = resource_config.get("test_folder", "test")
     
     print(f"📁 설정 파일: {config_path}")
-    print(f"🎵 오디오 설정: 길이 {audio_duration}초, 샘플링 레이트 {sample_rate}Hz")
-    print(f"   매 요청마다 새로운 음성과 유사한 오디오 생성 (캐시 방지)")
-    print(f"   (포먼트, 하모닉, 진폭 변조 포함)")
+    
+    # 오디오 소스에 따른 설정 출력 및 함수 생성
+    if use_random_audio:
+        # 랜덤 오디오 생성 모드일 때만 유효성 검사
+        if warmup_requests >= total_requests:
+            print("❌ 오류: warmup_requests는 total_requests보다 작아야 합니다.")
+            return
+        print(f"🎵 오디오 설정: 랜덤 생성 모드")
+        print(f"   길이 {audio_duration}초, 샘플링 레이트 {sample_rate}Hz")
+        print(f"   매 요청마다 새로운 음성과 유사한 오디오 생성 (캐시 방지)")
+        print(f"   (포먼트, 하모닉, 진폭 변조 포함)")
+        
+        # 랜덤 오디오 생성 함수
+        def audio_generator(is_warmup: bool = False):
+            """음성과 유사한 오디오 생성 함수 (시간 측정 제외)"""
+            return generate_speech_like_audio(
+                duration_seconds=audio_duration,
+                sample_rate=sample_rate
+            )
+    else:
+        # Resource 폴더 경로 구성
+        warmup_folder_path = os.path.join(resource_base_path, resource_warmup_folder)
+        test_folder_path = os.path.join(resource_base_path, resource_test_folder)
+        
+        print(f"🎵 오디오 설정: Resource 폴더 사용 모드")
+        print(f"   Warm-up 폴더: {warmup_folder_path}")
+        print(f"   Test 폴더: {test_folder_path}")
+        
+        # 폴더 존재 확인 및 파일 목록 로드
+        warmup_audio_files = []
+        test_audio_files = []
+        
+        if os.path.exists(warmup_folder_path):
+            warmup_audio_files = get_all_audio_files(warmup_folder_path)
+            print(f"   Warm-up 파일 수: {len(warmup_audio_files)}개")
+        else:
+            print(f"⚠️ 경고: Warm-up 폴더를 찾을 수 없습니다: {warmup_folder_path}")
+        
+        if os.path.exists(test_folder_path):
+            test_audio_files = get_all_audio_files(test_folder_path)
+            print(f"   Test 파일 수: {len(test_audio_files)}개")
+        else:
+            print(f"⚠️ 경고: Test 폴더를 찾을 수 없습니다: {test_folder_path}")
+        
+        if not warmup_audio_files and not test_audio_files:
+            print("❌ 오류: 사용 가능한 오디오 파일이 없습니다.")
+            return
+        
+        # Resource 폴더 사용 시 파일 개수에 맞춰 요청 수 자동 조정
+        if warmup_audio_files:
+            actual_warmup_requests = len(warmup_audio_files)
+            if warmup_requests != actual_warmup_requests:
+                print(f"ℹ️  Warm-up 요청 수를 파일 개수에 맞춰 조정: {warmup_requests} → {actual_warmup_requests}")
+                warmup_requests = actual_warmup_requests
+        else:
+            warmup_requests = 0
+            print(f"ℹ️  Warm-up 폴더가 비어있어 Warm-up 요청 수를 0으로 설정")
+        
+        if test_audio_files:
+            actual_test_requests = len(test_audio_files)
+            actual_total_requests = warmup_requests + actual_test_requests
+            if total_requests != actual_total_requests:
+                print(f"ℹ️  총 요청 수를 파일 개수에 맞춰 조정: {total_requests} → {actual_total_requests}")
+                total_requests = actual_total_requests
+        else:
+            print("❌ 오류: Test 폴더에 오디오 파일이 없습니다.")
+            return
+        
+        # 파일 인덱스를 추적하기 위한 변수 (클로저에서 사용)
+        warmup_file_index = [0]  # 리스트로 감싸서 참조 전달
+        test_file_index = [0]
+        
+        # Resource 폴더에서 파일 읽기 함수 (순차적으로 모든 파일 사용)
+        def audio_generator(is_warmup: bool = False):
+            """Resource 폴더에서 오디오 파일을 순차적으로 읽기 (시간 측정 제외)"""
+            if is_warmup:
+                if not warmup_audio_files:
+                    raise ValueError(f"Warm-up 폴더에 오디오 파일이 없습니다: {warmup_folder_path}")
+                # 순환하여 사용 (요청 수가 파일 수보다 많을 경우)
+                file_path = warmup_audio_files[warmup_file_index[0] % len(warmup_audio_files)]
+                warmup_file_index[0] += 1
+            else:
+                if not test_audio_files:
+                    raise ValueError(f"Test 폴더에 오디오 파일이 없습니다: {test_folder_path}")
+                # 순환하여 사용 (요청 수가 파일 수보다 많을 경우)
+                file_path = test_audio_files[test_file_index[0] % len(test_audio_files)]
+                test_file_index[0] += 1
+            
+            audio_data = load_audio_from_file(file_path)
+            # 파일명 정보를 저장 (나중에 API 호출 시 사용)
+            audio_data.filename = os.path.basename(file_path)
+            return audio_data
+    
     print(f"🌐 API 설정: {base_url}{endpoint}")
     print()
-    
-    # 오디오 생성 함수
-    def audio_generator():
-        """음성과 유사한 오디오 생성 함수 (시간 측정 제외)"""
-        return generate_speech_like_audio(
-            duration_seconds=audio_duration,
-            sample_rate=sample_rate
-        )
     
     # API 호출 함수 (오디오 데이터를 인자로 받음)
     async def api_call_func(audio_data: io.BytesIO):
         """STT API 호출 함수 (시간 측정에 포함)"""
-        return await http_stt_call(audio_data, base_url, endpoint)
+        # 파일명이 있으면 사용, 없으면 기본값 사용
+        filename = getattr(audio_data, 'filename', 'audio.wav')
+        return await http_stt_call(audio_data, base_url, endpoint, filename=filename)
     
     # 테스터 생성 및 실행
     tester = STTLoadTester(

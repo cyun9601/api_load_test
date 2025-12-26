@@ -1,19 +1,29 @@
 # STT 모델 로드 테스트 설정 파일
 
 # 테스트 설정
-total_requests: 50          # 총 요청 수 (N)
-warmup_requests: 5          # Warm-up 요청 수 (M) - 이 개수만큼 버림
 concurrent_requests: 1      # 동시 요청 수
 request_delay: 1.0          # 요청 간 지연 시간 (초)
 
 # 오디오 설정
-audio_duration: 10.0        # 생성할 오디오 길이 (초)
-sample_rate: 16000          # 오디오 샘플링 레이트 (Hz)
+use_random_audio: false     # 랜덤으로 오디오 생성 여부 (true: 랜덤 생성, false: resource 폴더 사용)
 save_audio_samples: false   # 랜덤으로 생성된 음성 파일 저장 여부 (true/false)
+
+# 랜덤 오디오 생성 설정 (use_random_audio가 true일 때만 사용)
+random_audio:
+  total_requests: 50        # 총 요청 수 (N)
+  warmup_requests: 5        # Warm-up 요청 수 (M) - 이 개수만큼 버림
+  audio_duration: 10.0      # 생성할 오디오 길이 (초)
+  sample_rate: 16000        # 오디오 샘플링 레이트 (Hz)
+
+# Resource 폴더 설정 (use_random_audio가 false일 때 사용, 파일 개수에 맞춰 자동 조정)
+resource:
+  base_path: "resource"     # resource 폴더 경로
+  warmup_folder: "warm_up"  # warm-up용 오디오 파일 폴더
+  test_folder: "test"       # 성능 테스트용 오디오 파일 폴더
 
 # API 설정
 api:
-  base_url: "http://192.168.73.172:7653"
+  base_url: "http://192.168.73.172:31016"
   endpoint: "/v1/audio/transcriptions"
 
 # 결과 저장 설정
