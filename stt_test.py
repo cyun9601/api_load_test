@@ -1077,7 +1077,9 @@ async def http_stt_call(audio_data: io.BytesIO, base_url: str, endpoint: str, fi
         data = aiohttp.FormData()
         # 바이트 데이터를 파일로 전송
         data.add_field('file', audio_bytes, filename=filename, content_type=content_type)
-        # 필요시 추가 필드 (예: model, language 등)
+        # 언어 설정
+        data.add_field('language', 'ko')
+        # 필요시 추가 필드 (예: model 등)
         # data.add_field('model', 'whisper-1')
         
         try:
