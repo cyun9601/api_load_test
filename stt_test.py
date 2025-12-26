@@ -40,7 +40,7 @@ class PerformanceMetrics:
 
 
 class STTLoadTester:
-    """STT 모델 로드 테스터"""
+    """STT 모델 부하 테스터"""
     
     def __init__(
         self,
@@ -49,7 +49,8 @@ class STTLoadTester:
         total_requests: int,
         warmup_requests: int,
         concurrent_requests: int = 1,
-        request_delay: float = 0.0
+        request_delay: float = 0.0,
+        save_audio_samples: bool = False
     ):
         """
         Args:
@@ -59,6 +60,7 @@ class STTLoadTester:
             warmup_requests: 버릴 warm-up 요청 수 (M)
             concurrent_requests: 동시 요청 수
             request_delay: 요청 간 지연 시간 (초)
+            save_audio_samples: 오디오 샘플 저장 여부
         """
         self.api_call_func = api_call_func
         self.audio_generator_func = audio_generator_func
@@ -68,16 +70,62 @@ class STTLoadTester:
         self.request_delay = request_delay
         self.results: List[TestResult] = []  # 성능 테스트 결과
         self.warmup_results: List[TestResult] = []  # Cold start (warmup) 결과
+        self.save_audio_samples: bool = save_audio_samples  # 오디오 샘플 저장 여부
+        self.saved_audio_count: int = 0  # 저장된 오디오 개수
+        self.result_dir: str = "result"  # 결과 저장 디렉토리
     
-    async def _make_request(self, request_id: int) -> TestResult:
+    def _save_audio_sample(self, audio_data: io.BytesIO, request_type: str, request_id: int):
+        """오디오 샘플을 파일로 저장"""
+        if not self.save_audio_samples:
+            return
+        
+        # 첫 번째 warmup과 첫 번째 성능 테스트만 저장
+        if request_type == "warmup" and request_id == 0:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"audio_sample_warmup_{timestamp}.wav"
+            self._write_audio_file(audio_data, filename)
+            self.saved_audio_count += 1
+        elif request_type == "performance" and request_id == 0:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"audio_sample_performance_{timestamp}.wav"
+            self._write_audio_file(audio_data, filename)
+            self.saved_audio_count += 1
+    
+    def _ensure_result_dir(self):
+        """result 폴더가 없으면 생성"""
+        if not os.path.exists(self.result_dir):
+            os.makedirs(self.result_dir)
+    
+    def _write_audio_file(self, audio_data: io.BytesIO, filename: str):
+        """오디오 데이터를 파일로 저장"""
+        try:
+            self._ensure_result_dir()
+            filepath = os.path.join(self.result_dir, filename)
+            audio_data.seek(0)
+            with open(filepath, 'wb') as f:
+                f.write(audio_data.read())
+            print(f"🎵 오디오 샘플 저장: {filepath}")
+        except Exception as e:
+            print(f"⚠️ 오디오 저장 실패: {e}")
+    
+    async def _make_request(self, request_id: int, is_warmup: bool = False) -> TestResult:
         """단일 요청 실행 (오디오 생성 시간 제외)"""
         # 오디오 생성 (시간 측정 제외)
         audio_data = self.audio_generator_func()
         
+        # 오디오 샘플 저장
+        request_type = "warmup" if is_warmup else "performance"
+        self._save_audio_sample(audio_data, request_type, request_id)
+        
+        # API 호출을 위해 오디오 데이터를 다시 읽을 수 있도록 복사
+        audio_data.seek(0)
+        audio_bytes = audio_data.read()
+        audio_data_copy = io.BytesIO(audio_bytes)
+        
         # API 호출만 시간 측정에 포함
         start_time = time.time()
         try:
-            await self.api_call_func(audio_data)
+            await self.api_call_func(audio_data_copy)
             response_time = time.time() - start_time
             return TestResult(response_time=response_time, success=True)
         except Exception as e:
@@ -97,7 +145,7 @@ class STTLoadTester:
             async with semaphore:
                 if self.request_delay > 0:
                     await asyncio.sleep(self.request_delay)
-                result = await self._make_request(request_id)
+                result = await self._make_request(request_id, is_warmup=is_warmup)
                 if is_warmup:
                     # Warmup (cold start) 결과 저장
                     self.warmup_results.append(result)
@@ -119,7 +167,7 @@ class STTLoadTester:
         print(f"   Warm-up 요청 수: {self.warmup_requests}")
         print(f"   동시 요청 수: {self.concurrent_requests}")
         print(f"   실제 측정 요청 수: {self.total_requests - self.warmup_requests}")
-        print(f"   매 요청마다 새로운 랜덤 오디오 생성")
+        print(f"   매 요청마다 새로운 음성과 유사한 오디오 생성")
         print()
         
         # Warm-up 단계
@@ -207,9 +255,13 @@ class STTLoadTester:
             print("⚠️ 성공한 요청이 없어 히스토그램을 생성할 수 없습니다.")
             return
         
+        self._ensure_result_dir()
+        
         if filename is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"response_time_histogram_{timestamp}.png"
+        
+        filepath = os.path.join(self.result_dir, filename)
         
         # Font settings
         plt.rcParams['font.family'] = 'DejaVu Sans'
@@ -293,10 +345,10 @@ class STTLoadTester:
                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         
         plt.tight_layout()
-        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        plt.savefig(filepath, dpi=300, bbox_inches='tight')
         plt.close()
         
-        print(f"📊 히스토그램이 {filename}에 저장되었습니다.")
+        print(f"📊 히스토그램이 {filepath}에 저장되었습니다.")
     
     def save_timeline_graph(self, filename: Optional[str] = None):
         """요청 인덱스별 응답 시간 추이 그래프를 저장"""
@@ -308,9 +360,13 @@ class STTLoadTester:
             print("⚠️ 성공한 요청이 없어 타임라인 그래프를 생성할 수 없습니다.")
             return
         
+        self._ensure_result_dir()
+        
         if filename is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"response_time_timeline_{timestamp}.png"
+        
+        filepath = os.path.join(self.result_dir, filename)
         
         # Font settings
         plt.rcParams['font.family'] = 'DejaVu Sans'
@@ -411,16 +467,20 @@ class STTLoadTester:
                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         
         plt.tight_layout()
-        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        plt.savefig(filepath, dpi=300, bbox_inches='tight')
         plt.close()
         
-        print(f"📈 타임라인 그래프가 {filename}에 저장되었습니다.")
+        print(f"📈 타임라인 그래프가 {filepath}에 저장되었습니다.")
     
     def save_results(self, metrics: PerformanceMetrics, filename: Optional[str] = None):
         """결과를 JSON 파일로 저장"""
+        self._ensure_result_dir()
+        
         if filename is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"stt_load_test_results_{timestamp}.json"
+        
+        filepath = os.path.join(self.result_dir, filename)
         
         data = {
             "timestamp": datetime.now().isoformat(),
@@ -452,19 +512,25 @@ class STTLoadTester:
             ]
         }
         
-        with open(filename, 'w', encoding='utf-8') as f:
+        with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
         
-        print(f"\n💾 결과가 {filename}에 저장되었습니다.")
+        print(f"\n💾 결과가 {filepath}에 저장되었습니다.")
         
         # 히스토그램과 타임라인 그래프 저장
         self.save_histogram()
         self.save_timeline_graph()
 
 
-def generate_random_audio(duration_seconds: float = 10.0, sample_rate: int = 16000) -> io.BytesIO:
+def generate_speech_like_audio(duration_seconds: float = 10.0, sample_rate: int = 16000) -> io.BytesIO:
     """
-    랜덤 오디오 데이터를 생성하여 WAV 파일 형식의 BytesIO 객체로 반환
+    실제 사람 음성과 유사한 오디오 데이터를 생성하여 WAV 파일 형식의 BytesIO 객체로 반환
+    
+    사람 음성의 특성을 모방:
+    - 기본 주파수(F0)와 하모닉 구조
+    - 포먼트(Formant) 주파수 (F1, F2, F3)
+    - 시간에 따른 진폭 변조 (envelope)
+    - 자연스러운 주파수 변조
     
     Args:
         duration_seconds: 오디오 길이 (초) - 기본값: 10.0
@@ -475,23 +541,97 @@ def generate_random_audio(duration_seconds: float = 10.0, sample_rate: int = 160
     """
     # 샘플 수 계산
     num_samples = int(duration_seconds * sample_rate)
-    
-    # 랜덤 오디오 데이터 생성 (화이트 노이즈 + 여러 주파수 조합)
-    # 다양한 주파수 성분을 추가하여 더 현실적인 오디오 생성
     t = np.linspace(0, duration_seconds, num_samples)
     
-    # 랜덤 주파수와 진폭으로 여러 사인파 생성
+    # 기본 주파수 (F0) - 사람 음성 범위: 남성 85-180Hz, 여성 165-255Hz
+    # 랜덤하게 선택하되 자연스러운 범위
+    base_f0 = random.uniform(100, 250)  # 일반적인 음성 범위
+    
+    # 포먼트 주파수 (Formant frequencies) - 사람 음성의 특성 주파수
+    # F1: 300-1000Hz, F2: 800-3000Hz, F3: 2000-3500Hz
+    formant_f1 = random.uniform(400, 800)
+    formant_f2 = random.uniform(1000, 2500)
+    formant_f3 = random.uniform(2500, 3500)
+    
+    # 초기 오디오 데이터
     audio_data = np.zeros(num_samples)
-    num_components = random.randint(3, 8)
     
-    for _ in range(num_components):
-        frequency = random.uniform(100, 2000)  # 100Hz ~ 2000Hz
-        amplitude = random.uniform(0.1, 0.5)
+    # 기본 주파수와 하모닉 생성 (음성의 하모닉 구조)
+    # 기본 주파수와 그 배음들을 생성
+    num_harmonics = random.randint(5, 10)
+    for h in range(1, num_harmonics + 1):
+        harmonic_freq = base_f0 * h
+        if harmonic_freq < sample_rate / 2:  # 나이퀴스트 주파수 제한
+            # 하모닉의 진폭은 고주파수로 갈수록 감소
+            amplitude = 0.3 / h * random.uniform(0.7, 1.3)
+            phase = random.uniform(0, 2 * np.pi)
+            audio_data += amplitude * np.sin(2 * np.pi * harmonic_freq * t + phase)
+    
+    # 포먼트 강조 (Formant emphasis)
+    # 포먼트 주파수 주변의 주파수를 강조
+    for formant_freq in [formant_f1, formant_f2, formant_f3]:
+        # 포먼트 주변의 여러 주파수 성분 추가
+        for offset in [-50, -25, 0, 25, 50]:
+            freq = formant_freq + offset
+            if 50 < freq < sample_rate / 2:
+                amplitude = random.uniform(0.1, 0.3)
+                phase = random.uniform(0, 2 * np.pi)
+                audio_data += amplitude * np.sin(2 * np.pi * freq * t + phase)
+    
+    # 시간에 따른 진폭 변조 (Envelope) - 음성이 시작되고 끝나는 자연스러운 패턴
+    # 여러 "음절" 또는 "단어" 패턴 생성
+    num_segments = random.randint(3, 8)
+    segment_length = num_samples // num_segments
+    
+    envelope = np.ones(num_samples)
+    for i in range(num_segments):
+        start_idx = i * segment_length
+        end_idx = min((i + 1) * segment_length, num_samples)
+        segment_len = end_idx - start_idx
+        
+        # 각 세그먼트에 attack-decay-sustain-release (ADSR) envelope 적용
+        attack_len = int(segment_len * 0.1)
+        decay_len = int(segment_len * 0.1)
+        sustain_len = int(segment_len * 0.6)
+        release_len = segment_len - attack_len - decay_len - sustain_len
+        
+        # Attack
+        if attack_len > 0:
+            envelope[start_idx:start_idx + attack_len] = np.linspace(0, 1, attack_len)
+        # Decay
+        if decay_len > 0:
+            decay_start = start_idx + attack_len
+            envelope[decay_start:decay_start + decay_len] = np.linspace(1, 0.7, decay_len)
+        # Sustain
+        if sustain_len > 0:
+            sustain_start = start_idx + attack_len + decay_len
+            envelope[sustain_start:sustain_start + sustain_len] = 0.7 + 0.2 * np.random.random(sustain_len)
+        # Release
+        if release_len > 0:
+            release_start = start_idx + attack_len + decay_len + sustain_len
+            envelope[release_start:end_idx] = np.linspace(0.7, 0, release_len)
+    
+    # Envelope 적용
+    audio_data *= envelope
+    
+    # 기본 주파수의 자연스러운 변조 (Vibrato/Tremolo 효과)
+    vibrato_rate = random.uniform(4, 7)  # Hz
+    vibrato_depth = random.uniform(0.02, 0.05)  # 주파수 변조 깊이
+    f0_modulation = 1 + vibrato_depth * np.sin(2 * np.pi * vibrato_rate * t)
+    
+    # 주파수 변조를 적용하기 위해 재생성 (간단한 근사)
+    modulated_audio = np.zeros(num_samples)
+    for h in range(1, min(5, num_harmonics) + 1):
+        harmonic_freq = base_f0 * h * f0_modulation
+        amplitude = 0.2 / h
         phase = random.uniform(0, 2 * np.pi)
-        audio_data += amplitude * np.sin(2 * np.pi * frequency * t + phase)
+        modulated_audio += amplitude * np.sin(2 * np.pi * harmonic_freq * t + phase)
     
-    # 화이트 노이즈 추가
-    noise = np.random.normal(0, 0.1, num_samples)
+    # 원본과 변조된 신호를 혼합
+    audio_data = 0.7 * audio_data + 0.3 * modulated_audio
+    
+    # 자연스러운 노이즈 추가 (음성에는 항상 약간의 노이즈가 있음)
+    noise = np.random.normal(0, 0.05, num_samples)
     audio_data += noise
     
     # 정규화 (-1.0 ~ 1.0 범위로)
@@ -599,6 +739,7 @@ async def main():
     request_delay = config.get("request_delay", 0.0)
     audio_duration = config.get("audio_duration", 10.0)
     sample_rate = config.get("sample_rate", 16000)
+    save_audio_samples = config.get("save_audio_samples", False)
     save_path = config.get("save_path", None)
     base_url = config.get("api", {}).get("base_url", "http://192.168.73.172:8000")
     endpoint = config.get("api", {}).get("endpoint", "/v1/audio/transcriptions")
@@ -610,14 +751,15 @@ async def main():
     
     print(f"📁 설정 파일: {config_path}")
     print(f"🎵 오디오 설정: 길이 {audio_duration}초, 샘플링 레이트 {sample_rate}Hz")
-    print(f"   매 요청마다 새로운 랜덤 오디오 생성 (캐시 방지)")
+    print(f"   매 요청마다 새로운 음성과 유사한 오디오 생성 (캐시 방지)")
+    print(f"   (포먼트, 하모닉, 진폭 변조 포함)")
     print(f"🌐 API 설정: {base_url}{endpoint}")
     print()
     
     # 오디오 생성 함수
     def audio_generator():
-        """랜덤 오디오 생성 함수 (시간 측정 제외)"""
-        return generate_random_audio(
+        """음성과 유사한 오디오 생성 함수 (시간 측정 제외)"""
+        return generate_speech_like_audio(
             duration_seconds=audio_duration,
             sample_rate=sample_rate
         )
@@ -634,7 +776,8 @@ async def main():
         total_requests=total_requests,
         warmup_requests=warmup_requests,
         concurrent_requests=concurrent_requests,
-        request_delay=request_delay
+        request_delay=request_delay,
+        save_audio_samples=save_audio_samples
     )
     
     metrics = await tester.run()

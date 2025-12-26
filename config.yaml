@@ -2,13 +2,14 @@
 
 # 테스트 설정
 total_requests: 50          # 총 요청 수 (N)
-warmup_requests: 20          # Warm-up 요청 수 (M) - 이 개수만큼 버림
-concurrent_requests: 1       # 동시 요청 수
+warmup_requests: 5          # Warm-up 요청 수 (M) - 이 개수만큼 버림
+concurrent_requests: 1      # 동시 요청 수
 request_delay: 1.0          # 요청 간 지연 시간 (초)
 
 # 오디오 설정
 audio_duration: 10.0        # 생성할 오디오 길이 (초)
 sample_rate: 16000          # 오디오 샘플링 레이트 (Hz)
+save_audio_samples: false   # 랜덤으로 생성된 음성 파일 저장 여부 (true/false)
 
 # API 설정
 api:
