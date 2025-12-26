@@ -22,6 +22,9 @@ class TestResult:
     response_time: float
     success: bool
     error: Optional[str] = None
+    text: Optional[str] = None  # STT 예측 텍스트
+    audio_duration: Optional[float] = None  # 오디오 길이 (초)
+    rtf: Optional[float] = None  # Real-Time Factor (처리 시간 / 오디오 길이)
 
 
 @dataclass
@@ -37,6 +40,12 @@ class PerformanceMetrics:
     p95_response_time: float
     p99_response_time: float
     requests_per_second: float
+    avg_rtf: float  # 평균 RTF
+    min_rtf: float  # 최소 RTF
+    max_rtf: float  # 최대 RTF
+    median_rtf: float  # 중앙값 RTF
+    p95_rtf: float  # P95 RTF
+    p99_rtf: float  # P99 RTF
 
 
 class STTLoadTester:
@@ -73,6 +82,8 @@ class STTLoadTester:
         self.save_audio_samples: bool = save_audio_samples  # 오디오 샘플 저장 여부
         self.saved_audio_count: int = 0  # 저장된 오디오 개수
         self.result_dir: str = "result"  # 결과 저장 디렉토리
+        self.timestamp_dir: Optional[str] = None  # 타임스탬프 하위 디렉토리
+        self.audio_duration: Optional[float] = None  # 랜덤 오디오 생성 시 오디오 길이
     
     def _save_audio_sample(self, audio_data: io.BytesIO, request_type: str, request_id: int):
         """오디오 샘플을 파일로 저장"""
@@ -92,15 +103,23 @@ class STTLoadTester:
             self.saved_audio_count += 1
     
     def _ensure_result_dir(self):
-        """result 폴더가 없으면 생성"""
+        """result 폴더와 타임스탬프 하위 폴더가 없으면 생성"""
         if not os.path.exists(self.result_dir):
             os.makedirs(self.result_dir)
+        
+        # 타임스탬프 하위 폴더가 없으면 생성
+        if self.timestamp_dir is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.timestamp_dir = os.path.join(self.result_dir, timestamp)
+        
+        if not os.path.exists(self.timestamp_dir):
+            os.makedirs(self.timestamp_dir)
     
     def _write_audio_file(self, audio_data: io.BytesIO, filename: str):
         """오디오 데이터를 파일로 저장"""
         try:
             self._ensure_result_dir()
-            filepath = os.path.join(self.result_dir, filename)
+            filepath = os.path.join(self.timestamp_dir, filename)
             audio_data.seek(0)
             with open(filepath, 'wb') as f:
                 f.write(audio_data.read())
@@ -112,6 +131,27 @@ class STTLoadTester:
         """단일 요청 실행 (오디오 생성 시간 제외)"""
         # 오디오 생성 (시간 측정 제외)
         audio_data = self.audio_generator_func(is_warmup=is_warmup)
+        
+        # 오디오 길이 측정
+        audio_duration = None
+        if self.audio_duration is not None:
+            # 랜덤 오디오 생성 모드
+            audio_duration = self.audio_duration
+        else:
+            # Resource 폴더 모드 - 파일에서 측정
+            file_path = getattr(audio_data, 'file_path', None)
+            if file_path:
+                audio_duration = get_audio_duration(audio_data, file_path)
+                if audio_duration is None and request_id == 0:  # 첫 요청에서만 경고
+                    print(f"⚠️ 오디오 길이를 측정할 수 없습니다: {file_path}")
+                    print(f"   MP3 파일인 경우 'pip install mutagen'을 실행하세요.")
+            else:
+                # file_path가 없으면 filename으로 시도
+                filename = getattr(audio_data, 'filename', None)
+                if filename:
+                    audio_duration = get_audio_duration(audio_data, filename)
+                else:
+                    audio_duration = get_audio_duration(audio_data)
         
         # 오디오 샘플 저장
         request_type = "warmup" if is_warmup else "performance"
@@ -125,15 +165,44 @@ class STTLoadTester:
         # API 호출만 시간 측정에 포함
         start_time = time.time()
         try:
-            await self.api_call_func(audio_data_copy)
+            response = await self.api_call_func(audio_data_copy)
             response_time = time.time() - start_time
-            return TestResult(response_time=response_time, success=True)
+            
+            # STT 예측 텍스트 추출
+            text = None
+            if isinstance(response, dict):
+                # 다양한 응답 형식 지원
+                text = response.get("text") or response.get("transcription") or response.get("result")
+            elif isinstance(response, str):
+                text = response
+            
+            # RTF 계산 (Real-Time Factor = 처리 시간 / 오디오 길이)
+            rtf = None
+            if audio_duration and audio_duration > 0:
+                rtf = response_time / audio_duration
+            
+            return TestResult(
+                response_time=response_time,
+                success=True,
+                text=text,
+                audio_duration=audio_duration,
+                rtf=rtf
+            )
         except Exception as e:
             response_time = time.time() - start_time
+            
+            # RTF 계산 (실패한 경우에도)
+            rtf = None
+            if audio_duration and audio_duration > 0:
+                rtf = response_time / audio_duration
+            
             return TestResult(
                 response_time=response_time,
                 success=False,
-                error=str(e)
+                error=str(e),
+                text=None,
+                audio_duration=audio_duration,
+                rtf=rtf
             )
     
     async def _run_requests(self, num_requests: int, is_warmup: bool = False) -> List[TestResult]:
@@ -162,12 +231,16 @@ class STTLoadTester:
     
     async def run(self) -> PerformanceMetrics:
         """로드 테스트 실행"""
+        # 타임스탬프 폴더 생성
+        self._ensure_result_dir()
+        
         print(f"🚀 STT 모델 로드 테스트 시작")
         print(f"   총 요청 수: {self.total_requests}")
         print(f"   Warm-up 요청 수: {self.warmup_requests}")
         print(f"   동시 요청 수: {self.concurrent_requests}")
         print(f"   실제 측정 요청 수: {self.total_requests - self.warmup_requests}")
         print(f"   매 요청마다 새로운 음성과 유사한 오디오 생성")
+        print(f"   결과 저장 경로: {self.timestamp_dir}")
         print()
         
         # Warm-up 단계
@@ -205,6 +278,16 @@ class STTLoadTester:
         sorted_times = sorted(successful_response_times)
         n = len(sorted_times)
         
+        # RTF 계산 (성공한 요청 중 RTF가 있는 것만)
+        rtf_values = [r.rtf for r in successful_results if r.rtf is not None]
+        
+        if rtf_values:
+            sorted_rtf = sorted(rtf_values)
+            n_rtf = len(sorted_rtf)
+        else:
+            sorted_rtf = []
+            n_rtf = 0
+        
         return PerformanceMetrics(
             total_requests=len(self.results),
             successful_requests=len(successful_results),
@@ -215,7 +298,13 @@ class STTLoadTester:
             median_response_time=statistics.median(sorted_times),
             p95_response_time=sorted_times[int(n * 0.95)] if n > 0 else 0,
             p99_response_time=sorted_times[int(n * 0.99)] if n > 0 else 0,
-            requests_per_second=len(self.results) / total_time if total_time > 0 else 0
+            requests_per_second=len(self.results) / total_time if total_time > 0 else 0,
+            avg_rtf=statistics.mean(rtf_values) if rtf_values else 0.0,
+            min_rtf=min(rtf_values) if rtf_values else 0.0,
+            max_rtf=max(rtf_values) if rtf_values else 0.0,
+            median_rtf=statistics.median(sorted_rtf) if sorted_rtf else 0.0,
+            p95_rtf=sorted_rtf[int(n_rtf * 0.95)] if n_rtf > 0 else 0.0,
+            p99_rtf=sorted_rtf[int(n_rtf * 0.99)] if n_rtf > 0 else 0.0
         )
     
     def print_results(self, metrics: PerformanceMetrics):
@@ -235,6 +324,15 @@ class STTLoadTester:
         print(f"  P95: {metrics.p95_response_time:.3f}초")
         print(f"  P99: {metrics.p99_response_time:.3f}초")
         print()
+        print("RTF (Real-Time Factor) 통계:")
+        print(f"  평균: {metrics.avg_rtf:.3f}")
+        print(f"  중앙값: {metrics.median_rtf:.3f}")
+        print(f"  최소: {metrics.min_rtf:.3f}")
+        print(f"  최대: {metrics.max_rtf:.3f}")
+        print(f"  P95: {metrics.p95_rtf:.3f}")
+        print(f"  P99: {metrics.p99_rtf:.3f}")
+        print(f"  (RTF < 1.0: 실시간보다 빠름, RTF > 1.0: 실시간보다 느림)")
+        print()
         print(f"처리량: {metrics.requests_per_second:.2f} 요청/초")
         print("="*60)
         
@@ -246,10 +344,12 @@ class STTLoadTester:
                     print(f"  요청 #{i+1}: {result.error}")
     
     def save_histogram(self, filename: Optional[str] = None):
-        """응답 시간 도수분포표(히스토그램)를 저장 (Cold start와 성능 테스트 구분)"""
+        """응답 시간 및 RTF 도수분포표(히스토그램)를 저장 (Cold start와 성능 테스트 구분)"""
         # Cold start (warmup)와 성능 테스트 결과 수집
         warmup_response_times = [r.response_time for r in self.warmup_results if r.success]
         performance_response_times = [r.response_time for r in self.results if r.success]
+        warmup_rtf = [r.rtf for r in self.warmup_results if r.success and r.rtf is not None]
+        performance_rtf = [r.rtf for r in self.results if r.success and r.rtf is not None]
         
         if not warmup_response_times and not performance_response_times:
             print("⚠️ 성공한 요청이 없어 히스토그램을 생성할 수 없습니다.")
@@ -258,19 +358,18 @@ class STTLoadTester:
         self._ensure_result_dir()
         
         if filename is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"response_time_histogram_{timestamp}.png"
+            filename = "response_time_histogram.png"
         
-        filepath = os.path.join(self.result_dir, filename)
+        filepath = os.path.join(self.timestamp_dir, filename)
         
         # Font settings
         plt.rcParams['font.family'] = 'DejaVu Sans'
         plt.rcParams['axes.unicode_minus'] = False
         
-        # 히스토그램 생성
-        fig, ax = plt.subplots(figsize=(12, 7))
+        # 히스토그램 생성 (위아래 서브플롯: 위=응답 시간, 아래=RTF)
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 12))
         
-        # 모든 응답 시간을 합쳐서 bins 범위 결정
+        # === 위쪽: 응답 시간 히스토그램 ===
         all_times = warmup_response_times + performance_response_times
         if all_times:
             min_time = min(all_times)
@@ -281,18 +380,18 @@ class STTLoadTester:
         
         # Cold start (warmup) histogram
         if warmup_response_times:
-            ax.hist(
+            ax1.hist(
                 warmup_response_times,
                 bins=bins,
                 edgecolor='black',
                 alpha=0.6,
                 color='orange',
-                label=f'Cold Start (Warm-up) ({len(warmup_response_times)} requests)'
+                label=f'Cold Start ({len(warmup_response_times)} requests)'
             )
         
         # Performance test histogram
         if performance_response_times:
-            ax.hist(
+            ax1.hist(
                 performance_response_times,
                 bins=bins,
                 edgecolor='black',
@@ -301,13 +400,12 @@ class STTLoadTester:
                 label=f'Performance Test ({len(performance_response_times)} requests)'
             )
         
-        # Calculate and display statistics
+        # 통계 정보
         stats_lines = []
-        
         if warmup_response_times:
             warmup_avg = statistics.mean(warmup_response_times)
             warmup_median = statistics.median(warmup_response_times)
-            ax.axvline(warmup_avg, color='red', linestyle='--', linewidth=1.5, alpha=0.7, 
+            ax1.axvline(warmup_avg, color='red', linestyle='--', linewidth=1.5, alpha=0.7, 
                      label=f'Cold Start Avg: {warmup_avg:.3f}s')
             stats_lines.append(f'Cold Start: {len(warmup_response_times)} requests')
             stats_lines.append(f'  Avg: {warmup_avg:.3f}s')
@@ -316,7 +414,7 @@ class STTLoadTester:
         if performance_response_times:
             perf_avg = statistics.mean(performance_response_times)
             perf_median = statistics.median(performance_response_times)
-            ax.axvline(perf_avg, color='blue', linestyle='--', linewidth=1.5, alpha=0.7,
+            ax1.axvline(perf_avg, color='blue', linestyle='--', linewidth=1.5, alpha=0.7,
                      label=f'Performance Test Avg: {perf_avg:.3f}s')
             if not stats_lines:
                 stats_lines.append('Performance Test:')
@@ -328,21 +426,93 @@ class STTLoadTester:
             stats_lines.append(f'\nOverall Min: {min(all_times):.3f}s')
             stats_lines.append(f'Overall Max: {max(all_times):.3f}s')
         
-        ax.set_xlabel('Response Time (seconds)', fontsize=12)
-        ax.set_ylabel('Frequency', fontsize=12)
-        ax.set_title('STT API Response Time Histogram (Cold Start vs Performance Test)', fontsize=14, fontweight='bold')
-        ax.legend(fontsize=10, loc='upper right')
-        ax.grid(True, alpha=0.3)
+        ax1.set_xlabel('Response Time (seconds)', fontsize=12)
+        ax1.set_ylabel('Frequency', fontsize=12)
+        ax1.set_title('Response Time Histogram (Cold Start vs Performance Test)', fontsize=13, fontweight='bold')
+        ax1.legend(fontsize=10, loc='upper right')
+        ax1.grid(True, alpha=0.3)
         
-        # 통계 정보 텍스트 추가
         stats_text = '\n'.join(stats_lines)
-        
-        ax.text(0.98, 0.98, stats_text,
-                transform=ax.transAxes,
+        ax1.text(0.98, 0.98, stats_text,
+                transform=ax1.transAxes,
                 fontsize=9,
                 verticalalignment='top',
                 horizontalalignment='right',
                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        
+        # === 아래쪽: RTF 히스토그램 ===
+        all_rtf = warmup_rtf + performance_rtf
+        if all_rtf:
+            min_rtf = min(all_rtf)
+            max_rtf = max(all_rtf)
+            bins_rtf = np.linspace(min_rtf, max_rtf, 30)
+        else:
+            bins_rtf = 30
+        
+        # Cold start RTF histogram
+        if warmup_rtf:
+            ax2.hist(
+                warmup_rtf,
+                bins=bins_rtf,
+                edgecolor='black',
+                alpha=0.6,
+                color='orange',
+                label=f'Cold Start ({len(warmup_rtf)} requests)'
+            )
+        
+        # Performance test RTF histogram
+        if performance_rtf:
+            ax2.hist(
+                performance_rtf,
+                bins=bins_rtf,
+                edgecolor='black',
+                alpha=0.6,
+                color='steelblue',
+                label=f'Performance Test ({len(performance_rtf)} requests)'
+            )
+        
+        # RTF 통계 정보
+        rtf_stats_lines = []
+        if warmup_rtf:
+            warmup_rtf_avg = statistics.mean(warmup_rtf)
+            warmup_rtf_median = statistics.median(warmup_rtf)
+            ax2.axvline(warmup_rtf_avg, color='red', linestyle='--', linewidth=1.5, alpha=0.7, 
+                     label=f'Cold Start Avg: {warmup_rtf_avg:.3f}')
+            rtf_stats_lines.append(f'Cold Start: {len(warmup_rtf)} requests')
+            rtf_stats_lines.append(f'  Avg RTF: {warmup_rtf_avg:.3f}')
+            rtf_stats_lines.append(f'  Median RTF: {warmup_rtf_median:.3f}')
+        
+        if performance_rtf:
+            perf_rtf_avg = statistics.mean(performance_rtf)
+            perf_rtf_median = statistics.median(performance_rtf)
+            ax2.axvline(perf_rtf_avg, color='blue', linestyle='--', linewidth=1.5, alpha=0.7,
+                     label=f'Performance Test Avg: {perf_rtf_avg:.3f}')
+            if not rtf_stats_lines:
+                rtf_stats_lines.append('Performance Test:')
+            rtf_stats_lines.append(f'  {len(performance_rtf)} requests')
+            rtf_stats_lines.append(f'  Avg RTF: {perf_rtf_avg:.3f}')
+            rtf_stats_lines.append(f'  Median RTF: {perf_rtf_median:.3f}')
+        
+        if all_rtf:
+            rtf_stats_lines.append(f'\nOverall Min RTF: {min(all_rtf):.3f}')
+            rtf_stats_lines.append(f'Overall Max RTF: {max(all_rtf):.3f}')
+            # RTF = 1.0 기준선 표시
+            ax2.axvline(1.0, color='green', linestyle=':', linewidth=2, alpha=0.7,
+                       label='RTF = 1.0 (Real-time)')
+        
+        ax2.set_xlabel('RTF (Real-Time Factor)', fontsize=12)
+        ax2.set_ylabel('Frequency', fontsize=12)
+        ax2.set_title('RTF Histogram (Cold Start vs Performance Test)', fontsize=13, fontweight='bold')
+        ax2.legend(fontsize=10, loc='upper right')
+        ax2.grid(True, alpha=0.3)
+        
+        rtf_stats_text = '\n'.join(rtf_stats_lines)
+        ax2.text(0.98, 0.98, rtf_stats_text,
+                transform=ax2.transAxes,
+                fontsize=9,
+                verticalalignment='top',
+                horizontalalignment='right',
+                bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.5))
         
         plt.tight_layout()
         plt.savefig(filepath, dpi=300, bbox_inches='tight')
@@ -351,7 +521,7 @@ class STTLoadTester:
         print(f"📊 히스토그램이 {filepath}에 저장되었습니다.")
     
     def save_timeline_graph(self, filename: Optional[str] = None):
-        """요청 인덱스별 응답 시간 추이 그래프를 저장"""
+        """요청 인덱스별 응답 시간 및 RTF 추이 그래프를 저장"""
         # 모든 요청 결과 수집 (cold start + 성능 테스트)
         all_results = self.warmup_results + self.results
         successful_results = [r for r in all_results if r.success]
@@ -363,21 +533,21 @@ class STTLoadTester:
         self._ensure_result_dir()
         
         if filename is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"response_time_timeline_{timestamp}.png"
+            filename = "response_time_timeline.png"
         
-        filepath = os.path.join(self.result_dir, filename)
+        filepath = os.path.join(self.timestamp_dir, filename)
         
         # Font settings
         plt.rcParams['font.family'] = 'DejaVu Sans'
         plt.rcParams['axes.unicode_minus'] = False
         
-        # 그래프 생성
-        fig, ax = plt.subplots(figsize=(14, 7))
+        # 그래프 생성 (위아래 서브플롯: 위=응답 시간, 아래=RTF)
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 12))
         
-        # 요청 인덱스와 응답 시간 분리
+        # 요청 인덱스와 응답 시간, RTF 분리
         request_indices = []
         response_times = []
+        rtf_values = []
         is_warmup_list = []
         
         # Warmup 결과 추가
@@ -385,6 +555,7 @@ class STTLoadTester:
             if result.success:
                 request_indices.append(idx + 1)
                 response_times.append(result.response_time)
+                rtf_values.append(result.rtf if result.rtf is not None else None)
                 is_warmup_list.append(True)
         
         # 성능 테스트 결과 추가
@@ -393,52 +564,59 @@ class STTLoadTester:
             if result.success:
                 request_indices.append(warmup_count + idx + 1)
                 response_times.append(result.response_time)
+                rtf_values.append(result.rtf if result.rtf is not None else None)
                 is_warmup_list.append(False)
         
         # Cold start와 성능 테스트를 색상으로 구분
         warmup_indices = [idx for idx, is_warmup in zip(request_indices, is_warmup_list) if is_warmup]
         warmup_times = [time for time, is_warmup in zip(response_times, is_warmup_list) if is_warmup]
+        warmup_rtf = [rtf for rtf, is_warmup in zip(rtf_values, is_warmup_list) if is_warmup and rtf is not None]
+        warmup_rtf_indices = [idx for idx, (rtf, is_warmup) in zip(request_indices, zip(rtf_values, is_warmup_list)) if is_warmup and rtf is not None]
+        
         perf_indices = [idx for idx, is_warmup in zip(request_indices, is_warmup_list) if not is_warmup]
         perf_times = [time for time, is_warmup in zip(response_times, is_warmup_list) if not is_warmup]
+        perf_rtf = [rtf for rtf, is_warmup in zip(rtf_values, is_warmup_list) if not is_warmup and rtf is not None]
+        perf_rtf_indices = [idx for idx, (rtf, is_warmup) in zip(request_indices, zip(rtf_values, is_warmup_list)) if not is_warmup and rtf is not None]
         
+        # === 위쪽: 응답 시간 타임라인 ===
         # Cold start 플롯
         if warmup_indices:
-            ax.scatter(warmup_indices, warmup_times, 
+            ax1.scatter(warmup_indices, warmup_times, 
                       color='orange', alpha=0.6, s=30, 
-                      label=f'Cold Start (Warm-up) ({len(warmup_indices)} requests)')
-            ax.plot(warmup_indices, warmup_times, 
+                      label=f'Cold Start ({len(warmup_indices)} requests)')
+            ax1.plot(warmup_indices, warmup_times, 
                    color='orange', alpha=0.3, linewidth=1)
         
         # 성능 테스트 플롯
         if perf_indices:
-            ax.scatter(perf_indices, perf_times, 
+            ax1.scatter(perf_indices, perf_times, 
                       color='steelblue', alpha=0.6, s=30,
                       label=f'Performance Test ({len(perf_indices)} requests)')
-            ax.plot(perf_indices, perf_times, 
+            ax1.plot(perf_indices, perf_times, 
                    color='steelblue', alpha=0.3, linewidth=1)
         
         # 평균선 표시
         if warmup_times:
             warmup_avg = statistics.mean(warmup_times)
-            ax.axhline(warmup_avg, color='red', linestyle='--', linewidth=1.5, alpha=0.7,
+            ax1.axhline(warmup_avg, color='red', linestyle='--', linewidth=1.5, alpha=0.7,
                       label=f'Cold Start Avg: {warmup_avg:.3f}s')
         
         if perf_times:
             perf_avg = statistics.mean(perf_times)
-            ax.axhline(perf_avg, color='blue', linestyle='--', linewidth=1.5, alpha=0.7,
+            ax1.axhline(perf_avg, color='blue', linestyle='--', linewidth=1.5, alpha=0.7,
                       label=f'Performance Test Avg: {perf_avg:.3f}s')
         
         # Cold start와 성능 테스트 경계선 표시
         if warmup_indices and perf_indices:
             boundary = max(warmup_indices)
-            ax.axvline(boundary, color='gray', linestyle=':', linewidth=1, alpha=0.5,
+            ax1.axvline(boundary, color='gray', linestyle=':', linewidth=1, alpha=0.5,
                       label='Warm-up / Performance Test Boundary')
         
-        ax.set_xlabel('Request Index', fontsize=12)
-        ax.set_ylabel('Response Time (seconds)', fontsize=12)
-        ax.set_title('STT API Response Time Timeline (All Requests)', fontsize=14, fontweight='bold')
-        ax.legend(fontsize=9, loc='upper right')
-        ax.grid(True, alpha=0.3)
+        ax1.set_xlabel('Request Index', fontsize=12)
+        ax1.set_ylabel('Response Time (seconds)', fontsize=12)
+        ax1.set_title('Response Time Timeline (All Requests)', fontsize=13, fontweight='bold')
+        ax1.legend(fontsize=9, loc='upper right')
+        ax1.grid(True, alpha=0.3)
         
         # 통계 정보 텍스트 추가
         stats_lines = []
@@ -446,6 +624,7 @@ class STTLoadTester:
             stats_lines.append(f'Cold Start: {len(warmup_times)} requests')
             stats_lines.append(f'  Avg: {statistics.mean(warmup_times):.3f}s')
             stats_lines.append(f'  Median: {statistics.median(warmup_times):.3f}s')
+        
         if perf_times:
             if stats_lines:
                 stats_lines.append('')
@@ -459,12 +638,86 @@ class STTLoadTester:
             stats_lines.append(f'Overall Max: {max(response_times):.3f}s')
         
         stats_text = '\n'.join(stats_lines)
-        ax.text(0.02, 0.98, stats_text,
-                transform=ax.transAxes,
+        ax1.text(0.02, 0.98, stats_text,
+                transform=ax1.transAxes,
                 fontsize=9,
                 verticalalignment='top',
                 horizontalalignment='left',
                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        
+        # === 아래쪽: RTF 타임라인 ===
+        # Cold start RTF 플롯
+        if warmup_rtf_indices:
+            ax2.scatter(warmup_rtf_indices, warmup_rtf, 
+                       color='orange', alpha=0.6, s=30, marker='o',
+                       label=f'Cold Start ({len(warmup_rtf)} requests)')
+            ax2.plot(warmup_rtf_indices, warmup_rtf, 
+                   color='orange', alpha=0.3, linewidth=1)
+        
+        # 성능 테스트 RTF 플롯
+        if perf_rtf_indices:
+            ax2.scatter(perf_rtf_indices, perf_rtf, 
+                       color='steelblue', alpha=0.6, s=30, marker='o',
+                       label=f'Performance Test ({len(perf_rtf)} requests)')
+            ax2.plot(perf_rtf_indices, perf_rtf, 
+                   color='steelblue', alpha=0.3, linewidth=1)
+        
+        # RTF 평균선 표시
+        if warmup_rtf:
+            warmup_rtf_avg = statistics.mean(warmup_rtf)
+            ax2.axhline(warmup_rtf_avg, color='red', linestyle='--', linewidth=1.5, alpha=0.7,
+                       label=f'Cold Start Avg: {warmup_rtf_avg:.3f}')
+        
+        if perf_rtf:
+            perf_rtf_avg = statistics.mean(perf_rtf)
+            ax2.axhline(perf_rtf_avg, color='blue', linestyle='--', linewidth=1.5, alpha=0.7,
+                       label=f'Performance Test Avg: {perf_rtf_avg:.3f}')
+        
+        # RTF = 1.0 기준선 표시
+        if warmup_rtf or perf_rtf:
+            ax2.axhline(1.0, color='green', linestyle='-.', linewidth=2, alpha=0.8,
+                       label='RTF = 1.0 (Real-time)')
+        
+        # Cold start와 성능 테스트 경계선 표시
+        if warmup_rtf_indices and perf_rtf_indices:
+            boundary = max(warmup_rtf_indices) if warmup_rtf_indices else 0
+            if boundary > 0:
+                ax2.axvline(boundary, color='gray', linestyle=':', linewidth=1, alpha=0.5,
+                          label='Warm-up / Performance Test Boundary')
+        
+        ax2.set_xlabel('Request Index', fontsize=12)
+        ax2.set_ylabel('RTF (Real-Time Factor)', fontsize=12)
+        ax2.set_title('RTF Timeline (All Requests)', fontsize=13, fontweight='bold')
+        ax2.legend(fontsize=9, loc='upper right')
+        ax2.grid(True, alpha=0.3)
+        
+        # RTF 통계 정보 텍스트 추가
+        rtf_stats_lines = []
+        if warmup_rtf:
+            rtf_stats_lines.append(f'Cold Start: {len(warmup_rtf)} requests')
+            rtf_stats_lines.append(f'  Avg RTF: {statistics.mean(warmup_rtf):.3f}')
+            rtf_stats_lines.append(f'  Median RTF: {statistics.median(warmup_rtf):.3f}')
+        
+        if perf_rtf:
+            if rtf_stats_lines:
+                rtf_stats_lines.append('')
+            rtf_stats_lines.append(f'Performance Test: {len(perf_rtf)} requests')
+            rtf_stats_lines.append(f'  Avg RTF: {statistics.mean(perf_rtf):.3f}')
+            rtf_stats_lines.append(f'  Median RTF: {statistics.median(perf_rtf):.3f}')
+        
+        if warmup_rtf or perf_rtf:
+            all_rtf_vals = warmup_rtf + perf_rtf
+            rtf_stats_lines.append('')
+            rtf_stats_lines.append(f'Overall Min RTF: {min(all_rtf_vals):.3f}')
+            rtf_stats_lines.append(f'Overall Max RTF: {max(all_rtf_vals):.3f}')
+        
+        rtf_stats_text = '\n'.join(rtf_stats_lines)
+        ax2.text(0.02, 0.98, rtf_stats_text,
+                transform=ax2.transAxes,
+                fontsize=9,
+                verticalalignment='top',
+                horizontalalignment='left',
+                bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.5))
         
         plt.tight_layout()
         plt.savefig(filepath, dpi=300, bbox_inches='tight')
@@ -477,10 +730,9 @@ class STTLoadTester:
         self._ensure_result_dir()
         
         if filename is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"stt_load_test_results_{timestamp}.json"
+            filename = "stt_load_test_results.json"
         
-        filepath = os.path.join(self.result_dir, filename)
+        filepath = os.path.join(self.timestamp_dir, filename)
         
         data = {
             "timestamp": datetime.now().isoformat(),
@@ -506,7 +758,8 @@ class STTLoadTester:
                 {
                     "response_time": r.response_time,
                     "success": r.success,
-                    "error": r.error
+                    "error": r.error,
+                    "text": r.text
                 }
                 for r in self.results
             ]
@@ -663,6 +916,82 @@ def generate_speech_like_audio(duration_seconds: float = 10.0, sample_rate: int 
         raise ValueError(f"WAV 파일 생성 중 오류: {e}")
 
 
+def get_audio_duration(audio_data: io.BytesIO, file_path: Optional[str] = None) -> Optional[float]:
+    """
+    오디오 데이터의 길이를 초 단위로 반환
+    
+    Args:
+        audio_data: 오디오 데이터 (BytesIO)
+        file_path: 파일 경로 (선택사항, 파일명에서 확장자 확인용)
+    
+    Returns:
+        오디오 길이 (초), 측정 불가능한 경우 None
+    """
+    try:
+        audio_data.seek(0)
+        
+        # 파일 경로가 있으면 확장자로 파일 타입 확인
+        if file_path:
+            file_ext = os.path.splitext(file_path.lower())[1]
+            
+            # WAV 파일인 경우
+            if file_ext == '.wav':
+                try:
+                    with wave.open(audio_data, 'rb') as wav_file:
+                        frames = wav_file.getnframes()
+                        sample_rate = wav_file.getframerate()
+                        duration = frames / float(sample_rate)
+                        audio_data.seek(0)
+                        return duration
+                except Exception as e:
+                    audio_data.seek(0)
+                    print(f"⚠️ WAV 파일 길이 측정 실패: {e}")
+                    return None
+            
+            # MP3 파일인 경우 - mutagen 라이브러리 사용 시도
+            elif file_ext == '.mp3':
+                try:
+                    from mutagen import File
+                    # 파일 경로에서 직접 읽기 (BytesIO가 아닌 실제 파일)
+                    audio_file = File(file_path)
+                    if audio_file is not None and hasattr(audio_file, 'info') and hasattr(audio_file.info, 'length'):
+                        duration = audio_file.info.length
+                        audio_data.seek(0)
+                        return duration
+                except ImportError:
+                    # mutagen이 설치되지 않은 경우 조용히 None 반환 (경고는 첫 요청에서만)
+                    pass
+                except Exception:
+                    # 오류 발생 시 조용히 None 반환
+                    pass
+                audio_data.seek(0)
+                return None
+        
+        # BytesIO에서 직접 WAV 파일인지 확인 (파일 경로가 없는 경우)
+        audio_data.seek(0)
+        header = audio_data.read(4)
+        audio_data.seek(0)
+        
+        if header == b'RIFF':
+            # WAV 파일로 시도
+            try:
+                with wave.open(audio_data, 'rb') as wav_file:
+                    frames = wav_file.getnframes()
+                    sample_rate = wav_file.getframerate()
+                    duration = frames / float(sample_rate)
+                    audio_data.seek(0)
+                    return duration
+            except Exception as e:
+                audio_data.seek(0)
+                print(f"⚠️ WAV 파일 길이 측정 실패: {e}")
+                return None
+        
+        return None
+    except Exception as e:
+        print(f"⚠️ 오디오 길이 측정 중 오류: {e}")
+        return None
+
+
 def load_audio_from_file(file_path: str) -> io.BytesIO:
     """
     파일에서 오디오 데이터를 읽어서 BytesIO 객체로 반환
@@ -679,6 +1008,8 @@ def load_audio_from_file(file_path: str) -> io.BytesIO:
         
         audio_buffer = io.BytesIO(audio_bytes)
         audio_buffer.seek(0)
+        # 파일 경로 정보 저장 (오디오 길이 측정용)
+        audio_buffer.file_path = file_path
         return audio_buffer
     except FileNotFoundError:
         raise FileNotFoundError(f"오디오 파일을 찾을 수 없습니다: {file_path}")
@@ -843,6 +1174,9 @@ async def main():
                 duration_seconds=audio_duration,
                 sample_rate=sample_rate
             )
+        
+        # 오디오 길이 저장 (RTF 계산용) - 나중에 tester에 설정
+        tester_audio_duration = audio_duration
     else:
         # Resource 폴더 경로 구성
         warmup_folder_path = os.path.join(resource_base_path, resource_warmup_folder)
@@ -915,6 +1249,8 @@ async def main():
             audio_data = load_audio_from_file(file_path)
             # 파일명 정보를 저장 (나중에 API 호출 시 사용)
             audio_data.filename = os.path.basename(file_path)
+            # file_path도 명시적으로 저장 (오디오 길이 측정용)
+            audio_data.file_path = file_path
             return audio_data
     
     print(f"🌐 API 설정: {base_url}{endpoint}")
@@ -937,6 +1273,10 @@ async def main():
         request_delay=request_delay,
         save_audio_samples=save_audio_samples
     )
+    
+    # 오디오 길이 설정 (랜덤 오디오 모드일 때만)
+    if use_random_audio:
+        tester.audio_duration = audio_duration
     
     metrics = await tester.run()
     tester.print_results(metrics)
