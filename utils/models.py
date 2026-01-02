@@ -16,6 +16,7 @@ class TestResult:
     audio_duration: Optional[float] = None  # 오디오 길이 (초)
     rtf: Optional[float] = None  # Real-Time Factor (처리 시간 / 오디오 길이)
     concurrent_users: Optional[int] = None  # 동시 사용자 수 (load test에서 사용)
+    ttft: Optional[float] = None  # Time to First Token (초, 스트리밍인 경우 클라이언트 측정)
 
 
 @dataclass

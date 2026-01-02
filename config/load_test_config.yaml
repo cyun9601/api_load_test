@@ -32,6 +32,12 @@ api:
   base_url: "http://192.168.73.172:32760"
   endpoint: "/v1/audio/transcriptions"
   model: "1225"  # STT 모델 이름
+  streaming: true  # 스트리밍 요청 여부 (true: 스트리밍, false: 일반 요청)
+
+# vLLM 메트릭 수집 설정 (동시성/batching 모니터링)
+vllm_metrics:
+  enable: true             # vLLM 메트릭 수집 활성화 여부 (api.base_url 사용)
+  collection_interval: 0.5  # 메트릭 수집 간격 (초)
 
 # 결과 저장 설정
 save_path: null              # 결과 저장 경로 (null이면 자동 생성)

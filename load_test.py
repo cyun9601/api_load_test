@@ -10,7 +10,7 @@ from utils.config import load_config
 
 
 # HTTP STT API 호출 함수
-async def http_stt_call(audio_data: io.BytesIO, base_url: str, endpoint: str, filename: str = 'audio.wav', model: str = '1225'):
+async def http_stt_call(audio_data: io.BytesIO, base_url: str, endpoint: str, filename: str = 'audio.wav', model: str = '1225', streaming: bool = False):
     """
     HTTP STT API 호출
     
@@ -20,8 +20,14 @@ async def http_stt_call(audio_data: io.BytesIO, base_url: str, endpoint: str, fi
         endpoint: API 엔드포인트
         filename: 파일명
         model: STT 모델 이름
+        streaming: 스트리밍 요청 여부
+    
+    Returns:
+        dict: {"text": str, "ttft": float} 형태 (streaming인 경우 ttft 포함)
     """
     import aiohttp
+    import time
+    import json
     
     url = f"{base_url}{endpoint}"
     
@@ -49,18 +55,64 @@ async def http_stt_call(audio_data: io.BytesIO, base_url: str, endpoint: str, fi
         # 언어 설정
         data.add_field('language', 'ko')
         
+        # 스트리밍 요청인 경우 stream 파라미터 추가
+        if streaming:
+            data.add_field('stream', 'true')
+        
         try:
             async with session.post(url, data=data) as response:
-                response_text = await response.text()
+                if response.status != 200:
+                    response_text = await response.text()
+                    raise Exception(f"API 호출 실패 (상태 코드: {response.status}): {response_text}")
                 
-                if response.status == 200:
+                # 스트리밍 응답 처리
+                if streaming:
+                    ttft = None
+                    first_token_time = None
+                    full_text = ""
+                    
+                    # 첫 번째 데이터 도착 시간 측정
+                    request_start_time = time.time()
+                    
+                    async for line in response.content:
+                        if first_token_time is None:
+                            first_token_time = time.time()
+                            ttft = first_token_time - request_start_time
+                        
+                        # SSE 형식 파싱 (data: prefix 제거)
+                        try:
+                            line_str = line.decode('utf-8').strip()
+                            if line_str.startswith('data: '):
+                                line_str = line_str[6:]  # 'data: ' 제거
+                            
+                            if line_str and line_str != '[DONE]':
+                                try:
+                                    chunk_data = json.loads(line_str)
+                                    # 텍스트 추출 (다양한 형식 지원)
+                                    chunk_text = chunk_data.get("text") or chunk_data.get("delta", {}).get("text", "") or chunk_data.get("content", "")
+                                    if chunk_text:
+                                        full_text += chunk_text
+                                except json.JSONDecodeError:
+                                    # JSON이 아닌 경우 텍스트로 처리
+                                    if line_str:
+                                        full_text += line_str
+                        except UnicodeDecodeError:
+                            # 바이너리 데이터인 경우 건너뛰기
+                            continue
+                    
+                    result = {"text": full_text}
+                    if ttft is not None:
+                        result["ttft"] = ttft
+                    return result
+                
+                # 일반 요청 처리
+                else:
+                    response_text = await response.text()
                     try:
                         return await response.json()
                     except:
                         # JSON이 아닌 경우 텍스트 반환
                         return {"text": response_text}
-                else:
-                    raise Exception(f"API 호출 실패 (상태 코드: {response.status}): {response_text}")
         except aiohttp.ClientError as e:
             raise Exception(f"네트워크 오류: {e}")
         except Exception as e:
@@ -100,6 +152,7 @@ async def main():
     base_url = api_config.get("base_url")
     endpoint = api_config.get("endpoint")
     model = api_config.get("model", "1225")  # 기본값: 1225
+    streaming = api_config.get("streaming", False)  # 기본값: False
     
     if not base_url or not endpoint:
         print("❌ 오류: API 설정(base_url, endpoint)이 누락되었습니다. config/load_test_config.yaml을 확인해주세요.")
@@ -169,13 +222,17 @@ async def main():
         tester_audio_duration = None
     
     print(f"🌐 API 설정: {base_url}{endpoint}")
+    print(f"   모델: {model}")
+    print(f"   스트리밍 모드: {'활성화' if streaming else '비활성화'}")
+    if streaming:
+        print(f"   ⚠️ 스트리밍 모드에서는 클라이언트에서 TTFT를 직접 측정합니다.")
     print()
     
     # API 호출 함수
     async def api_call_func(audio_data: io.BytesIO):
         """STT API 호출 함수"""
         filename = getattr(audio_data, 'filename', 'audio.wav')
-        return await http_stt_call(audio_data, base_url, endpoint, filename=filename, model=model)
+        return await http_stt_call(audio_data, base_url, endpoint, filename=filename, model=model, streaming=streaming)
     
     # 부하 테스터 생성 및 실행
     tester = STTLoadTester(
@@ -193,7 +250,17 @@ async def main():
         audio_duration=tester_audio_duration
     )
     
-    metrics = await tester.run()
+    # vLLM 메트릭 수집 설정 (api.base_url 사용)
+    vllm_metrics_config = config.get("vllm_metrics", {})
+    enable_vllm_metrics = vllm_metrics_config.get("enable", False)
+    vllm_base_url = base_url if enable_vllm_metrics else None  # API base_url 사용
+    vllm_metrics_interval = vllm_metrics_config.get("collection_interval", 1.0)
+    
+    metrics = await tester.run(
+        enable_vllm_metrics=enable_vllm_metrics,
+        vllm_base_url=vllm_base_url,
+        vllm_metrics_interval=vllm_metrics_interval
+    )
     tester.print_results(metrics)
     tester.save_results(metrics)
 

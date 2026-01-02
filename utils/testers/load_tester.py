@@ -17,6 +17,7 @@ matplotlib.use('Agg')  # GUI 없이 사용
 
 from ..models import TestResult, PerformanceMetrics
 from ..audio_utils import get_audio_duration
+from ..vllm_metrics import VLLMMetricsCollector
 
 
 class STTLoadTester:
@@ -74,6 +75,7 @@ class STTLoadTester:
         self.request_counter: int = 0  # 요청 카운터
         self.start_time: Optional[float] = None  # 테스트 시작 시간
         self.user_count_rtf_data: List[Dict] = []  # 동시 사용자 수별 RTF 데이터 [{user_count, avg_rtf, ...}]
+        self.vllm_metrics_collector: Optional[VLLMMetricsCollector] = None  # vLLM 메트릭 수집기
     
     def _save_audio_sample(self, audio_data: io.BytesIO, request_type: str, request_id: int):
         """오디오 샘플을 파일로 저장"""
@@ -151,8 +153,11 @@ class STTLoadTester:
             
             # STT 예측 텍스트 추출
             text = None
+            ttft = None
             if isinstance(response, dict):
                 text = response.get("text") or response.get("transcription") or response.get("result")
+                # 스트리밍인 경우 TTFT 추출
+                ttft = response.get("ttft")
             elif isinstance(response, str):
                 text = response
             
@@ -166,7 +171,8 @@ class STTLoadTester:
                 success=True,
                 text=text,
                 audio_duration=audio_duration,
-                rtf=rtf
+                rtf=rtf,
+                ttft=ttft
             )
         except Exception as e:
             response_time = time.time() - start_time
@@ -273,10 +279,27 @@ class STTLoadTester:
                     "request_count": len(successful_phase_results)
                 })
     
-    async def run(self) -> PerformanceMetrics:
-        """부하 테스트 실행"""
+    async def run(self, enable_vllm_metrics: bool = False, vllm_base_url: Optional[str] = None, vllm_metrics_interval: float = 1.0) -> PerformanceMetrics:
+        """
+        부하 테스트 실행
+        
+        Args:
+            enable_vllm_metrics: vLLM 메트릭 수집 활성화 여부
+            vllm_base_url: vLLM 서버 기본 URL
+            vllm_metrics_interval: 메트릭 수집 간격 (초)
+        """
         self._ensure_result_dir()
         self.start_time = time.time()
+        
+        # vLLM 메트릭 수집 시작
+        if enable_vllm_metrics and vllm_base_url:
+            self.vllm_metrics_collector = VLLMMetricsCollector(
+                base_url=vllm_base_url,
+                metrics_endpoint="/metrics",
+                collection_interval=vllm_metrics_interval
+            )
+            await self.vllm_metrics_collector.start_collecting()
+            print("📊 vLLM 메트릭 수집 시작")
         
         print(f"🚀 STT 모델 부하 테스트 시작")
         if self.enable_ramp_up:
@@ -345,6 +368,12 @@ class STTLoadTester:
         print(f"   전체 테스트 시간: {total_time:.2f}초")
         print()
         
+        # vLLM 메트릭 수집 중지
+        if self.vllm_metrics_collector:
+            await self.vllm_metrics_collector.stop_collecting()
+            print("📊 vLLM 메트릭 수집 중지")
+            print()
+        
         # 메트릭 계산
         return self._calculate_metrics(total_time)
     
@@ -412,6 +441,7 @@ class STTLoadTester:
             if ramp_up_successful:
                 ramp_up_times = [r.response_time for r in ramp_up_successful]
                 ramp_up_rtf = [r.rtf for r in ramp_up_successful if r.rtf is not None]
+                ramp_up_ttft = [r.ttft for r in ramp_up_successful if r.ttft is not None]
                 print("📈 Ramp-up 단계 통계:")
                 print(f"  요청 수: {len(self.ramp_up_results)}개 (성공: {len(ramp_up_successful)}개)")
                 print(f"  평균 응답 시간: {statistics.mean(ramp_up_times):.3f}초")
@@ -421,6 +451,11 @@ class STTLoadTester:
                     print(f"  중앙값 RTF: {statistics.median(ramp_up_rtf):.3f}")
                     print(f"  최소 RTF: {min(ramp_up_rtf):.3f}")
                     print(f"  최대 RTF: {max(ramp_up_rtf):.3f}")
+                if ramp_up_ttft:
+                    print(f"  평균 TTFT: {statistics.mean(ramp_up_ttft):.3f}초")
+                    print(f"  중앙값 TTFT: {statistics.median(ramp_up_ttft):.3f}초")
+                    print(f"  최소 TTFT: {min(ramp_up_ttft):.3f}초")
+                    print(f"  최대 TTFT: {max(ramp_up_ttft):.3f}초")
                 print()
         
         # Hold 단계 통계
@@ -429,6 +464,7 @@ class STTLoadTester:
             if hold_successful:
                 hold_times = [r.response_time for r in hold_successful]
                 hold_rtf = [r.rtf for r in hold_successful if r.rtf is not None]
+                hold_ttft = [r.ttft for r in hold_successful if r.ttft is not None]
                 print("🔥 Hold 단계 통계:")
                 print(f"  요청 수: {len(self.hold_results)}개 (성공: {len(hold_successful)}개)")
                 print(f"  평균 응답 시간: {statistics.mean(hold_times):.3f}초")
@@ -438,6 +474,11 @@ class STTLoadTester:
                     print(f"  중앙값 RTF: {statistics.median(hold_rtf):.3f}")
                     print(f"  최소 RTF: {min(hold_rtf):.3f}")
                     print(f"  최대 RTF: {max(hold_rtf):.3f}")
+                if hold_ttft:
+                    print(f"  평균 TTFT: {statistics.mean(hold_ttft):.3f}초")
+                    print(f"  중앙값 TTFT: {statistics.median(hold_ttft):.3f}초")
+                    print(f"  최소 TTFT: {min(hold_ttft):.3f}초")
+                    print(f"  최대 TTFT: {max(hold_ttft):.3f}초")
                 print()
         
         print("전체 통계:")
@@ -457,6 +498,21 @@ class STTLoadTester:
         print(f"  P95: {metrics.p95_rtf:.3f}")
         print(f"  P99: {metrics.p99_rtf:.3f}")
         print()
+        
+        # TTFT 통계 (스트리밍인 경우)
+        all_ttft = [r.ttft for r in self.results if r.success and r.ttft is not None]
+        if all_ttft:
+            sorted_ttft = sorted(all_ttft)
+            n_ttft = len(sorted_ttft)
+            print("TTFT (Time to First Token) 통계:")
+            print(f"  평균: {statistics.mean(all_ttft):.3f}초")
+            print(f"  중앙값: {statistics.median(sorted_ttft):.3f}초")
+            print(f"  최소: {min(all_ttft):.3f}초")
+            print(f"  최대: {max(all_ttft):.3f}초")
+            print(f"  P95: {sorted_ttft[int(n_ttft * 0.95)] if n_ttft > 0 else 0.0:.3f}초")
+            print(f"  P99: {sorted_ttft[int(n_ttft * 0.99)] if n_ttft > 0 else 0.0:.3f}초")
+            print()
+        
         print(f"처리량: {metrics.requests_per_second:.2f} 요청/초")
         print("="*60)
         
@@ -514,7 +570,9 @@ class STTLoadTester:
                     "error": r.error,
                     "text": r.text,
                     "audio_duration": r.audio_duration,
-                    "rtf": r.rtf
+                    "rtf": r.rtf,
+                    "ttft": r.ttft,
+                    "concurrent_users": r.concurrent_users
                 }
                 for r in self.ramp_up_results
             ],
@@ -525,7 +583,9 @@ class STTLoadTester:
                     "error": r.error,
                     "text": r.text,
                     "audio_duration": r.audio_duration,
-                    "rtf": r.rtf
+                    "rtf": r.rtf,
+                    "ttft": r.ttft,
+                    "concurrent_users": r.concurrent_users
                 }
                 for r in self.hold_results
             ],
@@ -537,6 +597,7 @@ class STTLoadTester:
                     "text": r.text,
                     "audio_duration": r.audio_duration,
                     "rtf": r.rtf,
+                    "ttft": r.ttft,
                     "concurrent_users": r.concurrent_users
                 }
                 for r in self.results
@@ -553,9 +614,14 @@ class STTLoadTester:
         self.save_timeline_graph()
         self.save_histogram()
         
-        # 동시 사용자 수별 RTF 추이 그래프 저장
-        if self.user_count_rtf_data:
-            self.save_user_count_rtf_graph()
+        # 동시 사용자 수별 RTF 및 TTFT 추이 그래프 저장 (하나의 figure로 통합)
+        has_ttft = any(r.ttft is not None for r in self.results if r.success)
+        if self.user_count_rtf_data or has_ttft:
+            self.save_user_count_combined_graph(has_ttft=has_ttft)
+        
+        # vLLM 메트릭 그래프 저장
+        if self.vllm_metrics_collector and self.vllm_metrics_collector.metrics_history:
+            self.save_vllm_metrics_graph()
     
     def save_timeline_graph(self, filename: Optional[str] = None):
         """시간대별 응답 시간 및 RTF 추이 그래프 저장"""
@@ -573,7 +639,14 @@ class STTLoadTester:
         plt.rcParams['font.family'] = 'DejaVu Sans'
         plt.rcParams['axes.unicode_minus'] = False
         
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 12))
+        # TTFT 데이터가 있는지 확인
+        has_ttft = any(r.ttft is not None for r in self.results if r.success)
+        
+        # TTFT가 있으면 3개 서브플롯, 없으면 2개 서브플롯
+        if has_ttft:
+            fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(16, 16))
+        else:
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 12))
         
         # 시간대별 데이터 수집 (Ramp-up과 Hold 구분)
         ramp_up_successful = [r for r in self.ramp_up_results if r.success]
@@ -586,6 +659,7 @@ class STTLoadTester:
         ramp_up_elapsed_times = []
         ramp_up_response_times = []
         ramp_up_rtf_values = []
+        ramp_up_ttft_values = []
         
         ramp_up_start_offset = 0  # Ramp-up은 0부터 시작
         for i, result in enumerate(ramp_up_successful):
@@ -594,11 +668,14 @@ class STTLoadTester:
             ramp_up_response_times.append(result.response_time)
             if result.rtf is not None:
                 ramp_up_rtf_values.append((elapsed_time, result.rtf))
+            if result.ttft is not None:
+                ramp_up_ttft_values.append((elapsed_time, result.ttft))
         
         # Hold 단계 데이터
         hold_elapsed_times = []
         hold_response_times = []
         hold_rtf_values = []
+        hold_ttft_values = []
         
         hold_start_offset = self.ramp_up_duration  # Hold는 Ramp-up 이후 시작
         for i, result in enumerate(hold_successful):
@@ -607,6 +684,8 @@ class STTLoadTester:
             hold_response_times.append(result.response_time)
             if result.rtf is not None:
                 hold_rtf_values.append((elapsed_time, result.rtf))
+            if result.ttft is not None:
+                hold_ttft_values.append((elapsed_time, result.ttft))
         
         # === 위쪽: 응답 시간 타임라인 ===
         # Ramp-up 단계 플롯
@@ -770,6 +849,90 @@ class STTLoadTester:
             else:
                 # 범위가 0인 경우 (모든 값이 같음) 약간의 여유 공간 추가
                 ax2.set_ylim(min_rtf - 0.1, max_rtf + 0.1)
+        
+        # === TTFT 타임라인 (TTFT 데이터가 있는 경우) ===
+        if has_ttft:
+            # Ramp-up TTFT 플롯
+            if ramp_up_ttft_values:
+                ramp_up_ttft_times, ramp_up_ttft_vals = zip(*ramp_up_ttft_values)
+                ax3.scatter(ramp_up_ttft_times, ramp_up_ttft_vals, alpha=0.5, s=10, color='orange', label=f'Ramp-up ({len(ramp_up_ttft_values)} requests)')
+                
+                # Ramp-up TTFT 이동 평균
+                if len(ramp_up_ttft_values) > 10:
+                    window_size = max(10, len(ramp_up_ttft_values) // 20)
+                    moving_avg_ttft = []
+                    moving_avg_ttft_times = []
+                    ttft_list = list(ramp_up_ttft_values)
+                    for i in range(window_size, len(ttft_list)):
+                        window_times = [t for t, _ in ttft_list[i-window_size:i]]
+                        window_values = [v for _, v in ttft_list[i-window_size:i]]
+                        moving_avg_ttft.append(statistics.mean(window_values))
+                        moving_avg_ttft_times.append(statistics.mean(window_times))
+                    
+                    ax3.plot(moving_avg_ttft_times, moving_avg_ttft, color='red', linewidth=2, alpha=0.7, label='Ramp-up TTFT Moving Avg')
+                
+                # Ramp-up TTFT 평균선
+                ramp_up_avg_ttft = statistics.mean(ramp_up_ttft_vals)
+                ax3.axhline(ramp_up_avg_ttft, color='orange', linestyle='--', linewidth=2, alpha=0.8,
+                           label=f'Ramp-up Avg TTFT: {ramp_up_avg_ttft:.3f}s')
+            
+            # Hold TTFT 플롯
+            if hold_ttft_values:
+                hold_ttft_times, hold_ttft_vals = zip(*hold_ttft_values)
+                ax3.scatter(hold_ttft_times, hold_ttft_vals, alpha=0.5, s=10, color='steelblue', label=f'Hold ({len(hold_ttft_values)} requests)')
+                
+                # Hold TTFT 이동 평균
+                if len(hold_ttft_values) > 10:
+                    window_size = max(10, len(hold_ttft_values) // 20)
+                    moving_avg_ttft = []
+                    moving_avg_ttft_times = []
+                    ttft_list = list(hold_ttft_values)
+                    for i in range(window_size, len(ttft_list)):
+                        window_times = [t for t, _ in ttft_list[i-window_size:i]]
+                        window_values = [v for _, v in ttft_list[i-window_size:i]]
+                        moving_avg_ttft.append(statistics.mean(window_values))
+                        moving_avg_ttft_times.append(statistics.mean(window_times))
+                    
+                    ax3.plot(moving_avg_ttft_times, moving_avg_ttft, color='blue', linewidth=2, alpha=0.7, label='Hold TTFT Moving Avg')
+                
+                # Hold TTFT 평균선
+                hold_avg_ttft = statistics.mean(hold_ttft_vals)
+                ax3.axhline(hold_avg_ttft, color='steelblue', linestyle='--', linewidth=2, alpha=0.8,
+                           label=f'Hold Avg TTFT: {hold_avg_ttft:.3f}s')
+            
+            # 전체 TTFT 평균선
+            all_ttft_vals = []
+            if ramp_up_ttft_values:
+                all_ttft_vals.extend([v for _, v in ramp_up_ttft_values])
+            if hold_ttft_values:
+                all_ttft_vals.extend([v for _, v in hold_ttft_values])
+            
+            if all_ttft_vals:
+                avg_ttft = statistics.mean(all_ttft_vals)
+                ax3.axhline(avg_ttft, color='green', linestyle=':', linewidth=1.5, alpha=0.7,
+                           label=f'Overall Average TTFT: {avg_ttft:.3f}s')
+            
+            # Ramp-up과 Hold 단계 경계선
+            if self.enable_ramp_up and self.enable_hold:
+                ax3.axvline(self.ramp_up_duration, color='orange', linestyle=':', linewidth=2, alpha=0.7,
+                           label='Ramp-up / Hold Boundary')
+            
+            ax3.set_xlabel('Elapsed Time (seconds)', fontsize=12)
+            ax3.set_ylabel('TTFT (Time to First Token) (seconds)', fontsize=12)
+            ax3.set_title('TTFT Timeline (Load Test)', fontsize=13, fontweight='bold')
+            ax3.legend(fontsize=9)
+            ax3.grid(True, alpha=0.3)
+            
+            # y축 범위를 데이터에 맞게 동적으로 조정
+            if all_ttft_vals:
+                min_ttft = min(all_ttft_vals)
+                max_ttft = max(all_ttft_vals)
+                ttft_range = max_ttft - min_ttft
+                if ttft_range > 0:
+                    y_margin = ttft_range * 0.1
+                    ax3.set_ylim(max(0, min_ttft - y_margin), max_ttft + y_margin)
+                else:
+                    ax3.set_ylim(max(0, min_ttft - 0.1), max_ttft + 0.1)
         
         plt.tight_layout()
         plt.savefig(filepath, dpi=300, bbox_inches='tight')
@@ -1003,4 +1166,432 @@ class STTLoadTester:
         plt.close()
         
         print(f"📊 동시 사용자 수별 RTF 추이 그래프가 {filepath}에 저장되었습니다.")
+    
+    def save_user_count_combined_graph(self, has_ttft: bool = False, filename: Optional[str] = None):
+        """동시 사용자 수별 RTF 및 TTFT 추이 그래프 저장 (하나의 figure로 통합)"""
+        if not self.user_count_rtf_data and not has_ttft:
+            print("⚠️ RTF 및 TTFT 데이터가 없어 그래프를 생성할 수 없습니다.")
+            return
+        
+        self._ensure_result_dir()
+        
+        if filename is None:
+            filename = "user_count_rtf_ttft_trend.png"
+        
+        filepath = os.path.join(self.timestamp_dir, filename)
+        
+        plt.rcParams['font.family'] = 'DejaVu Sans'
+        plt.rcParams['axes.unicode_minus'] = False
+        
+        # 서브플롯 개수 결정 (TTFT가 있으면 2개, 없으면 1개)
+        if has_ttft:
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 12))
+        else:
+            fig, ax1 = plt.subplots(1, 1, figsize=(14, 8))
+        
+        # === 위쪽: RTF 그래프 ===
+        if self.user_count_rtf_data:
+            # 데이터 준비
+            user_counts = [d["user_count"] for d in self.user_count_rtf_data]
+            avg_rtfs = [d["avg_rtf"] for d in self.user_count_rtf_data]
+            median_rtfs = [d["median_rtf"] for d in self.user_count_rtf_data]
+            min_rtfs = [d["min_rtf"] for d in self.user_count_rtf_data]
+            max_rtfs = [d["max_rtf"] for d in self.user_count_rtf_data]
+            phases = [d["phase"] for d in self.user_count_rtf_data]
+            
+            # Ramp-up과 Hold 구분
+            ramp_up_indices = [i for i, phase in enumerate(phases) if phase.startswith("ramp_up")]
+            hold_indices = [i for i, phase in enumerate(phases) if phase == "hold"]
+            
+            # Ramp-up 단계 플롯
+            if ramp_up_indices:
+                ramp_up_users = [user_counts[i] for i in ramp_up_indices]
+                ramp_up_avg_rtfs = [avg_rtfs[i] for i in ramp_up_indices]
+                ramp_up_median_rtfs = [median_rtfs[i] for i in ramp_up_indices]
+                ramp_up_min_rtfs = [min_rtfs[i] for i in ramp_up_indices]
+                ramp_up_max_rtfs = [max_rtfs[i] for i in ramp_up_indices]
+                
+                # 평균 RTF 선
+                ax1.plot(ramp_up_users, ramp_up_avg_rtfs, 'o-', color='orange', linewidth=2.5, 
+                       markersize=10, label='Ramp-up Average RTF', alpha=0.8)
+                # 중앙값 RTF 선
+                ax1.plot(ramp_up_users, ramp_up_median_rtfs, 's--', color='orange', linewidth=2, 
+                       markersize=8, label='Ramp-up Median RTF', alpha=0.7)
+                # Min-Max 범위
+                ax1.fill_between(ramp_up_users, ramp_up_min_rtfs, ramp_up_max_rtfs, 
+                               alpha=0.2, color='orange', label='Ramp-up Min-Max Range')
+            
+            # Hold 단계 플롯
+            if hold_indices:
+                hold_users = [user_counts[i] for i in hold_indices]
+                hold_avg_rtfs = [avg_rtfs[i] for i in hold_indices]
+                hold_median_rtfs = [median_rtfs[i] for i in hold_indices]
+                hold_min_rtfs = [min_rtfs[i] for i in hold_indices]
+                hold_max_rtfs = [max_rtfs[i] for i in hold_indices]
+                
+                # 평균 RTF 선
+                ax1.plot(hold_users, hold_avg_rtfs, 'o-', color='steelblue', linewidth=2.5, 
+                       markersize=10, label='Hold Average RTF', alpha=0.8)
+                # 중앙값 RTF 선
+                ax1.plot(hold_users, hold_median_rtfs, 's--', color='steelblue', linewidth=2, 
+                       markersize=8, label='Hold Median RTF', alpha=0.7)
+                # Min-Max 범위
+                ax1.fill_between(hold_users, hold_min_rtfs, hold_max_rtfs, 
+                               alpha=0.2, color='steelblue', label='Hold Min-Max Range')
+            
+            # 전체 평균선
+            if avg_rtfs:
+                overall_avg = statistics.mean(avg_rtfs)
+                ax1.axhline(overall_avg, color='green', linestyle=':', linewidth=1.5, alpha=0.7,
+                          label=f'Overall Average RTF: {overall_avg:.3f}')
+            
+            # RTF = 1.0 기준선 (실시간 처리 기준)
+            ax1.axhline(1.0, color='red', linestyle='--', linewidth=1.5, alpha=0.7,
+                      label='RTF = 1.0 (Real-time)')
+            
+            ax1.set_xlabel('Concurrent Users', fontsize=12)
+            ax1.set_ylabel('RTF (Real-Time Factor)', fontsize=12)
+            ax1.set_title('RTF Trend by Concurrent Users', fontsize=13, fontweight='bold')
+            ax1.legend(fontsize=10, loc='best')
+            ax1.grid(True, alpha=0.3)
+            
+            # y축 범위를 데이터에 맞게 동적으로 조정
+            if avg_rtfs:
+                min_rtf = min(min_rtfs)
+                max_rtf = max(max_rtfs)
+                rtf_range = max_rtf - min_rtf
+                if rtf_range > 0:
+                    y_margin = rtf_range * 0.1
+                    ax1.set_ylim(max(0, min_rtf - y_margin), max_rtf + y_margin)
+                else:
+                    ax1.set_ylim(max(0, min_rtf - 0.1), max_rtf + 0.1)
+        
+        # === 아래쪽: TTFT 그래프 (TTFT 데이터가 있는 경우) ===
+        if has_ttft:
+            # 동시 사용자 수별로 그룹화 (Ramp-up과 Hold 구분)
+            ramp_up_ttft_data: Dict[int, List[float]] = {}
+            hold_ttft_data: Dict[int, List[float]] = {}
+            
+            # Ramp-up 결과에서 TTFT 수집
+            for result in self.ramp_up_results:
+                if result.success and result.ttft is not None:
+                    user_count = result.concurrent_users if result.concurrent_users is not None else 0
+                    if user_count not in ramp_up_ttft_data:
+                        ramp_up_ttft_data[user_count] = []
+                    ramp_up_ttft_data[user_count].append(result.ttft)
+            
+            # Hold 결과에서 TTFT 수집
+            for result in self.hold_results:
+                if result.success and result.ttft is not None:
+                    user_count = result.concurrent_users if result.concurrent_users is not None else 0
+                    if user_count not in hold_ttft_data:
+                        hold_ttft_data[user_count] = []
+                    hold_ttft_data[user_count].append(result.ttft)
+            
+            # Ramp-up 데이터 정리
+            ramp_up_sorted_users = sorted(ramp_up_ttft_data.keys()) if ramp_up_ttft_data else []
+            ramp_up_avg_ttfts = []
+            ramp_up_median_ttfts = []
+            ramp_up_min_ttfts = []
+            ramp_up_max_ttfts = []
+            
+            for user_count in ramp_up_sorted_users:
+                ttft_values = ramp_up_ttft_data[user_count]
+                if ttft_values:
+                    ramp_up_avg_ttfts.append(statistics.mean(ttft_values))
+                    ramp_up_median_ttfts.append(statistics.median(ttft_values))
+                    ramp_up_min_ttfts.append(min(ttft_values))
+                    ramp_up_max_ttfts.append(max(ttft_values))
+            
+            # Hold 데이터 정리
+            hold_sorted_users = sorted(hold_ttft_data.keys()) if hold_ttft_data else []
+            hold_avg_ttfts = []
+            hold_median_ttfts = []
+            hold_min_ttfts = []
+            hold_max_ttfts = []
+            
+            for user_count in hold_sorted_users:
+                ttft_values = hold_ttft_data[user_count]
+                if ttft_values:
+                    hold_avg_ttfts.append(statistics.mean(ttft_values))
+                    hold_median_ttfts.append(statistics.median(ttft_values))
+                    hold_min_ttfts.append(min(ttft_values))
+                    hold_max_ttfts.append(max(ttft_values))
+            
+            # Ramp-up 단계 플롯
+            if ramp_up_sorted_users:
+                # 평균 TTFT 선
+                ax2.plot(ramp_up_sorted_users, ramp_up_avg_ttfts, 'o-', color='orange', linewidth=2.5, 
+                       markersize=10, label='Ramp-up Average TTFT', alpha=0.8)
+                # 중앙값 TTFT 선
+                ax2.plot(ramp_up_sorted_users, ramp_up_median_ttfts, 's--', color='orange', linewidth=2, 
+                       markersize=8, label='Ramp-up Median TTFT', alpha=0.7)
+                # Min-Max 범위
+                ax2.fill_between(ramp_up_sorted_users, ramp_up_min_ttfts, ramp_up_max_ttfts, 
+                               alpha=0.2, color='orange', label='Ramp-up Min-Max Range')
+            
+            # Hold 단계 플롯
+            if hold_sorted_users:
+                # 평균 TTFT 선
+                ax2.plot(hold_sorted_users, hold_avg_ttfts, 'o-', color='steelblue', linewidth=2.5, 
+                       markersize=10, label='Hold Average TTFT', alpha=0.8)
+                # 중앙값 TTFT 선
+                ax2.plot(hold_sorted_users, hold_median_ttfts, 's--', color='steelblue', linewidth=2, 
+                       markersize=8, label='Hold Median TTFT', alpha=0.7)
+                # Min-Max 범위
+                ax2.fill_between(hold_sorted_users, hold_min_ttfts, hold_max_ttfts, 
+                               alpha=0.2, color='steelblue', label='Hold Min-Max Range')
+            
+            # 전체 평균선
+            all_ttft_values = []
+            if ramp_up_avg_ttfts:
+                all_ttft_values.extend(ramp_up_avg_ttfts)
+            if hold_avg_ttfts:
+                all_ttft_values.extend(hold_avg_ttfts)
+            
+            if all_ttft_values:
+                overall_avg = statistics.mean(all_ttft_values)
+                ax2.axhline(overall_avg, color='green', linestyle=':', linewidth=1.5, alpha=0.7,
+                          label=f'Overall Average TTFT: {overall_avg:.3f}s')
+            
+            ax2.set_xlabel('Concurrent Users', fontsize=12)
+            ax2.set_ylabel('TTFT (Time to First Token) (seconds)', fontsize=12)
+            ax2.set_title('TTFT Trend by Concurrent Users', fontsize=13, fontweight='bold')
+            ax2.legend(fontsize=10, loc='best')
+            ax2.grid(True, alpha=0.3)
+            
+            # y축 범위를 데이터에 맞게 동적으로 조정
+            all_min_ttfts = ramp_up_min_ttfts + hold_min_ttfts
+            all_max_ttfts = ramp_up_max_ttfts + hold_max_ttfts
+            if all_min_ttfts and all_max_ttfts:
+                min_ttft = min(all_min_ttfts)
+                max_ttft = max(all_max_ttfts)
+                ttft_range = max_ttft - min_ttft
+                if ttft_range > 0:
+                    y_margin = ttft_range * 0.1
+                    ax2.set_ylim(max(0, min_ttft - y_margin), max_ttft + y_margin)
+                else:
+                    ax2.set_ylim(max(0, min_ttft - 0.1), max_ttft + 0.1)
+        
+        plt.tight_layout()
+        plt.savefig(filepath, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"📊 동시 사용자 수별 RTF 및 TTFT 추이 그래프가 {filepath}에 저장되었습니다.")
+    
+    def save_user_count_ttft_graph(self, filename: Optional[str] = None):
+        """동시 사용자 수별 TTFT 추이 그래프 저장"""
+        successful_results = [r for r in self.results if r.success and r.ttft is not None]
+        if not successful_results:
+            print("⚠️ TTFT 데이터가 없어 그래프를 생성할 수 없습니다.")
+            return
+        
+        self._ensure_result_dir()
+        
+        if filename is None:
+            filename = "user_count_ttft_trend.png"
+        
+        filepath = os.path.join(self.timestamp_dir, filename)
+        
+        plt.rcParams['font.family'] = 'DejaVu Sans'
+        plt.rcParams['axes.unicode_minus'] = False
+        
+        # 동시 사용자 수별로 그룹화
+        user_ttft_data: Dict[int, List[float]] = {}
+        for result in successful_results:
+            user_count = result.concurrent_users if result.concurrent_users is not None else 0
+            if user_count not in user_ttft_data:
+                user_ttft_data[user_count] = []
+            if result.ttft is not None:
+                user_ttft_data[user_count].append(result.ttft)
+        
+        if not user_ttft_data:
+            print("⚠️ 동시 사용자 수별 TTFT 데이터가 없어 그래프를 생성할 수 없습니다.")
+            return
+        
+        # 데이터 정리
+        sorted_users = sorted(user_ttft_data.keys())
+        avg_ttfts = []
+        median_ttfts = []
+        min_ttfts = []
+        max_ttfts = []
+        
+        for user_count in sorted_users:
+            ttft_values = user_ttft_data[user_count]
+            if ttft_values:
+                avg_ttfts.append(statistics.mean(ttft_values))
+                median_ttfts.append(statistics.median(ttft_values))
+                min_ttfts.append(min(ttft_values))
+                max_ttfts.append(max(ttft_values))
+            else:
+                sorted_users.remove(user_count)
+        
+        if not sorted_users:
+            print("⚠️ 유효한 TTFT 데이터가 없어 그래프를 생성할 수 없습니다.")
+            return
+        
+        # 그래프 생성
+        fig, ax = plt.subplots(1, 1, figsize=(14, 8))
+        
+        # Ramp-up과 Hold 단계 구분
+        ramp_up_indices = []
+        hold_indices = []
+        
+        for i, user_count in enumerate(sorted_users):
+            # Ramp-up 단계인지 확인 (user_count가 max_concurrent_users보다 작거나 같고, ramp_up 단계에 해당)
+            if self.enable_ramp_up and user_count <= self.max_concurrent_users:
+                # Ramp-up 단계의 사용자 수인지 확인
+                step_size = self.max_concurrent_users / self.ramp_up_steps
+                if user_count <= self.max_concurrent_users and (user_count % int(step_size) == 0 or user_count == self.max_concurrent_users):
+                    ramp_up_indices.append(i)
+                else:
+                    hold_indices.append(i)
+            else:
+                hold_indices.append(i)
+        
+        # Ramp-up 단계 데이터
+        if ramp_up_indices:
+            ramp_up_users = [sorted_users[i] for i in ramp_up_indices]
+            ramp_up_avg_ttfts = [avg_ttfts[i] for i in ramp_up_indices]
+            ramp_up_median_ttfts = [median_ttfts[i] for i in ramp_up_indices]
+            ramp_up_min_ttfts = [min_ttfts[i] for i in ramp_up_indices]
+            ramp_up_max_ttfts = [max_ttfts[i] for i in ramp_up_indices]
+            
+            # 평균 TTFT 선
+            ax.plot(ramp_up_users, ramp_up_avg_ttfts, 'o-', color='orange', linewidth=2.5, 
+                   markersize=10, label='Ramp-up Average TTFT', alpha=0.8)
+            # 중앙값 TTFT 선
+            ax.plot(ramp_up_users, ramp_up_median_ttfts, 's--', color='orange', linewidth=2, 
+                   markersize=8, label='Ramp-up Median TTFT', alpha=0.7)
+            # Min-Max 범위
+            ax.fill_between(ramp_up_users, ramp_up_min_ttfts, ramp_up_max_ttfts, 
+                           alpha=0.2, color='orange', label='Ramp-up Min-Max Range')
+        
+        # Hold 단계 데이터
+        if hold_indices:
+            hold_users = [sorted_users[i] for i in hold_indices]
+            hold_avg_ttfts = [avg_ttfts[i] for i in hold_indices]
+            hold_median_ttfts = [median_ttfts[i] for i in hold_indices]
+            hold_min_ttfts = [min_ttfts[i] for i in hold_indices]
+            hold_max_ttfts = [max_ttfts[i] for i in hold_indices]
+            
+            # 평균 TTFT 선
+            ax.plot(hold_users, hold_avg_ttfts, 'o-', color='steelblue', linewidth=2.5, 
+                   markersize=10, label='Hold Average TTFT', alpha=0.8)
+            # 중앙값 TTFT 선
+            ax.plot(hold_users, hold_median_ttfts, 's--', color='steelblue', linewidth=2, 
+                   markersize=8, label='Hold Median TTFT', alpha=0.7)
+            # Min-Max 범위
+            ax.fill_between(hold_users, hold_min_ttfts, hold_max_ttfts, 
+                           alpha=0.2, color='steelblue', label='Hold Min-Max Range')
+        
+        # 전체 평균선
+        if avg_ttfts:
+            overall_avg = statistics.mean(avg_ttfts)
+            ax.axhline(overall_avg, color='green', linestyle=':', linewidth=1.5, alpha=0.7,
+                      label=f'Overall Average TTFT: {overall_avg:.3f}s')
+        
+        ax.set_xlabel('Concurrent Users', fontsize=12)
+        ax.set_ylabel('TTFT (Time to First Token) (seconds)', fontsize=12)
+        ax.set_title('TTFT Trend by Concurrent Users', fontsize=13, fontweight='bold')
+        ax.legend(fontsize=10, loc='best')
+        ax.grid(True, alpha=0.3)
+        
+        # y축 범위를 데이터에 맞게 동적으로 조정
+        if avg_ttfts:
+            min_ttft = min(min_ttfts)
+            max_ttft = max(max_ttfts)
+            ttft_range = max_ttft - min_ttft
+            if ttft_range > 0:
+                y_margin = ttft_range * 0.1
+                ax.set_ylim(max(0, min_ttft - y_margin), max_ttft + y_margin)
+            else:
+                ax.set_ylim(max(0, min_ttft - 0.1), max_ttft + 0.1)
+        
+        plt.tight_layout()
+        plt.savefig(filepath, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"📊 동시 사용자 수별 TTFT 추이 그래프가 {filepath}에 저장되었습니다.")
+    
+    def save_vllm_metrics_graph(self, filename: Optional[str] = None):
+        """vLLM 메트릭 그래프 저장 (Running Requests, Waiting Requests)"""
+        if not self.vllm_metrics_collector or not self.vllm_metrics_collector.metrics_history:
+            print("⚠️ vLLM 메트릭 데이터가 없어 그래프를 생성할 수 없습니다.")
+            return
+        
+        self._ensure_result_dir()
+        
+        if filename is None:
+            filename = "vllm_metrics_requests.png"
+        
+        filepath = os.path.join(self.timestamp_dir, filename)
+        
+        plt.rcParams['font.family'] = 'DejaVu Sans'
+        plt.rcParams['axes.unicode_minus'] = False
+        
+        # 데이터 준비
+        timestamps = []
+        num_running = []
+        num_waiting = []
+        
+        start_time = self.start_time if self.start_time else 0
+        
+        for snapshot in self.vllm_metrics_collector.metrics_history:
+            elapsed_time = snapshot.timestamp - start_time
+            timestamps.append(elapsed_time)
+            
+            num_running.append(snapshot.num_requests_running if snapshot.num_requests_running is not None else 0)
+            num_waiting.append(snapshot.num_requests_waiting if snapshot.num_requests_waiting is not None else 0)
+        
+        if not timestamps:
+            print("⚠️ vLLM 메트릭 타임스탬프가 없어 그래프를 생성할 수 없습니다.")
+            return
+        
+        # 그래프 생성 (2개 서브플롯: 위=Running, 아래=Waiting)
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 12))
+        
+        # === 위쪽: Running Requests ===
+        ax1.plot(timestamps, num_running, color='blue', linewidth=2, alpha=0.8, label='Running Requests')
+        ax1.fill_between(timestamps, num_running, alpha=0.3, color='blue')
+        if num_running:
+            avg_running = statistics.mean(num_running)
+            ax1.axhline(avg_running, color='red', linestyle='--', linewidth=1.5, alpha=0.7,
+                       label=f'Average: {avg_running:.1f}')
+        
+        # Ramp-up과 Hold 경계선 표시
+        if self.enable_ramp_up and self.enable_hold:
+            ax1.axvline(self.ramp_up_duration, color='orange', linestyle=':', linewidth=2, alpha=0.7,
+                       label='Ramp-up / Hold Boundary')
+        
+        ax1.set_xlabel('Elapsed Time (seconds)', fontsize=12)
+        ax1.set_ylabel('Number of Running Requests', fontsize=12)
+        ax1.set_title('Running Requests Over Time (Batching)', fontsize=13, fontweight='bold')
+        ax1.legend(fontsize=10, loc='upper right')
+        ax1.grid(True, alpha=0.3)
+        
+        # === 아래쪽: Waiting Requests ===
+        ax2.plot(timestamps, num_waiting, color='orange', linewidth=2, alpha=0.8, label='Waiting Requests')
+        ax2.fill_between(timestamps, num_waiting, alpha=0.3, color='orange')
+        if num_waiting:
+            avg_waiting = statistics.mean(num_waiting)
+            ax2.axhline(avg_waiting, color='red', linestyle='--', linewidth=1.5, alpha=0.7,
+                       label=f'Average: {avg_waiting:.1f}')
+        
+        # Ramp-up과 Hold 경계선 표시
+        if self.enable_ramp_up and self.enable_hold:
+            ax2.axvline(self.ramp_up_duration, color='orange', linestyle=':', linewidth=2, alpha=0.7,
+                       label='Ramp-up / Hold Boundary')
+        
+        ax2.set_xlabel('Elapsed Time (seconds)', fontsize=12)
+        ax2.set_ylabel('Number of Waiting Requests', fontsize=12)
+        ax2.set_title('Waiting Requests Over Time', fontsize=13, fontweight='bold')
+        ax2.legend(fontsize=10, loc='upper right')
+        ax2.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(filepath, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"📊 vLLM 메트릭 그래프가 {filepath}에 저장되었습니다.")
 
