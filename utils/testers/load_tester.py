@@ -5,7 +5,7 @@ STT Load Tester 모듈 - 부하 테스트 전용
 import asyncio
 import time
 import statistics
-from typing import List, Optional, Callable
+from typing import List, Optional, Callable, Dict
 from datetime import datetime
 import json
 import io
@@ -73,6 +73,7 @@ class STTLoadTester:
         self.audio_duration: Optional[float] = audio_duration
         self.request_counter: int = 0  # 요청 카운터
         self.start_time: Optional[float] = None  # 테스트 시작 시간
+        self.user_count_rtf_data: List[Dict] = []  # 동시 사용자 수별 RTF 데이터 [{user_count, avg_rtf, ...}]
     
     def _save_audio_sample(self, audio_data: io.BytesIO, request_type: str, request_id: int):
         """오디오 샘플을 파일로 저장"""
@@ -238,11 +239,37 @@ class STTLoadTester:
         tasks = [continuous_request() for _ in range(concurrent_users)]
         await asyncio.gather(*tasks)
         
-        # 단계별 결과 분류
+        # 단계별 결과 분류 및 동시 사용자 수별 RTF 데이터 수집
         if phase_name.startswith("ramp_up"):
             self.ramp_up_results.extend(phase_results)
+            # 동시 사용자 수별 RTF 데이터 수집
+            successful_phase_results = [r for r in phase_results if r.success and r.rtf is not None]
+            if successful_phase_results:
+                rtf_values = [r.rtf for r in successful_phase_results]
+                self.user_count_rtf_data.append({
+                    "user_count": concurrent_users,
+                    "phase": phase_name,
+                    "avg_rtf": statistics.mean(rtf_values),
+                    "median_rtf": statistics.median(rtf_values),
+                    "min_rtf": min(rtf_values),
+                    "max_rtf": max(rtf_values),
+                    "request_count": len(successful_phase_results)
+                })
         elif phase_name == "hold":
             self.hold_results.extend(phase_results)
+            # Hold 단계도 동시 사용자 수별 데이터에 추가
+            successful_phase_results = [r for r in phase_results if r.success and r.rtf is not None]
+            if successful_phase_results:
+                rtf_values = [r.rtf for r in successful_phase_results]
+                self.user_count_rtf_data.append({
+                    "user_count": concurrent_users,
+                    "phase": "hold",
+                    "avg_rtf": statistics.mean(rtf_values),
+                    "median_rtf": statistics.median(rtf_values),
+                    "min_rtf": min(rtf_values),
+                    "max_rtf": max(rtf_values),
+                    "request_count": len(successful_phase_results)
+                })
     
     async def run(self) -> PerformanceMetrics:
         """부하 테스트 실행"""
@@ -508,9 +535,10 @@ class STTLoadTester:
                     "text": r.text,
                     "audio_duration": r.audio_duration,
                     "rtf": r.rtf
-                }
+                }''
                 for r in self.results
-            ]
+            ],
+            "user_count_rtf_data": self.user_count_rtf_data
         }
         
         with open(filepath, 'w', encoding='utf-8') as f:
@@ -521,6 +549,10 @@ class STTLoadTester:
         # 그래프 저장
         self.save_timeline_graph()
         self.save_histogram()
+        
+        # 동시 사용자 수별 RTF 추이 그래프 저장
+        if self.user_count_rtf_data:
+            self.save_user_count_rtf_graph()
     
     def save_timeline_graph(self, filename: Optional[str] = None):
         """시간대별 응답 시간 및 RTF 추이 그래프 저장"""
@@ -812,4 +844,104 @@ class STTLoadTester:
         plt.close()
         
         print(f"📊 히스토그램이 {filepath}에 저장되었습니다.")
+    
+    def save_user_count_rtf_graph(self, filename: Optional[str] = None):
+        """동시 사용자 수별 RTF 추이 그래프 저장"""
+        if not self.user_count_rtf_data:
+            print("⚠️ 동시 사용자 수별 RTF 데이터가 없어 그래프를 생성할 수 없습니다.")
+            return
+        
+        self._ensure_result_dir()
+        
+        if filename is None:
+            filename = "user_count_rtf_trend.png"
+        
+        filepath = os.path.join(self.timestamp_dir, filename)
+        
+        plt.rcParams['font.family'] = 'DejaVu Sans'
+        plt.rcParams['axes.unicode_minus'] = False
+        
+        # 데이터 준비
+        user_counts = [d["user_count"] for d in self.user_count_rtf_data]
+        avg_rtfs = [d["avg_rtf"] for d in self.user_count_rtf_data]
+        median_rtfs = [d["median_rtf"] for d in self.user_count_rtf_data]
+        min_rtfs = [d["min_rtf"] for d in self.user_count_rtf_data]
+        max_rtfs = [d["max_rtf"] for d in self.user_count_rtf_data]
+        phases = [d["phase"] for d in self.user_count_rtf_data]
+        
+        # Ramp-up과 Hold 구분
+        ramp_up_indices = [i for i, phase in enumerate(phases) if phase.startswith("ramp_up")]
+        hold_indices = [i for i, phase in enumerate(phases) if phase == "hold"]
+        
+        # 그래프 생성
+        fig, ax = plt.subplots(1, 1, figsize=(14, 8))
+        
+        # Ramp-up 단계 플롯
+        if ramp_up_indices:
+            ramp_up_users = [user_counts[i] for i in ramp_up_indices]
+            ramp_up_avg_rtfs = [avg_rtfs[i] for i in ramp_up_indices]
+            ramp_up_median_rtfs = [median_rtfs[i] for i in ramp_up_indices]
+            ramp_up_min_rtfs = [min_rtfs[i] for i in ramp_up_indices]
+            ramp_up_max_rtfs = [max_rtfs[i] for i in ramp_up_indices]
+            
+            # 평균 RTF 선
+            ax.plot(ramp_up_users, ramp_up_avg_rtfs, 'o-', color='orange', linewidth=2.5, 
+                   markersize=10, label='Ramp-up Average RTF', alpha=0.8)
+            # 중앙값 RTF 선
+            ax.plot(ramp_up_users, ramp_up_median_rtfs, 's--', color='orange', linewidth=2, 
+                   markersize=8, label='Ramp-up Median RTF', alpha=0.7)
+            # Min-Max 범위
+            ax.fill_between(ramp_up_users, ramp_up_min_rtfs, ramp_up_max_rtfs, 
+                           alpha=0.2, color='orange', label='Ramp-up Min-Max Range')
+        
+        # Hold 단계 플롯
+        if hold_indices:
+            hold_users = [user_counts[i] for i in hold_indices]
+            hold_avg_rtfs = [avg_rtfs[i] for i in hold_indices]
+            hold_median_rtfs = [median_rtfs[i] for i in hold_indices]
+            hold_min_rtfs = [min_rtfs[i] for i in hold_indices]
+            hold_max_rtfs = [max_rtfs[i] for i in hold_indices]
+            
+            # 평균 RTF 선
+            ax.plot(hold_users, hold_avg_rtfs, 'o-', color='steelblue', linewidth=2.5, 
+                   markersize=10, label='Hold Average RTF', alpha=0.8)
+            # 중앙값 RTF 선
+            ax.plot(hold_users, hold_median_rtfs, 's--', color='steelblue', linewidth=2, 
+                   markersize=8, label='Hold Median RTF', alpha=0.7)
+            # Min-Max 범위
+            ax.fill_between(hold_users, hold_min_rtfs, hold_max_rtfs, 
+                           alpha=0.2, color='steelblue', label='Hold Min-Max Range')
+        
+        # 전체 평균선
+        if avg_rtfs:
+            overall_avg = statistics.mean(avg_rtfs)
+            ax.axhline(overall_avg, color='green', linestyle=':', linewidth=1.5, alpha=0.7,
+                      label=f'Overall Average RTF: {overall_avg:.3f}')
+        
+        # RTF = 1.0 기준선 (실시간 처리 기준)
+        ax.axhline(1.0, color='red', linestyle='--', linewidth=1.5, alpha=0.7,
+                  label='RTF = 1.0 (Real-time)')
+        
+        ax.set_xlabel('Concurrent Users', fontsize=12)
+        ax.set_ylabel('RTF (Real-Time Factor)', fontsize=12)
+        ax.set_title('RTF Trend by Concurrent Users', fontsize=13, fontweight='bold')
+        ax.legend(fontsize=10, loc='best')
+        ax.grid(True, alpha=0.3)
+        
+        # y축 범위를 데이터에 맞게 동적으로 조정
+        if avg_rtfs:
+            min_rtf = min(min_rtfs)
+            max_rtf = max(max_rtfs)
+            rtf_range = max_rtf - min_rtf
+            if rtf_range > 0:
+                y_margin = rtf_range * 0.1
+                ax.set_ylim(max(0, min_rtf - y_margin), max_rtf + y_margin)
+            else:
+                ax.set_ylim(max(0, min_rtf - 0.1), max_rtf + 0.1)
+        
+        plt.tight_layout()
+        plt.savefig(filepath, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"📊 동시 사용자 수별 RTF 추이 그래프가 {filepath}에 저장되었습니다.")
 

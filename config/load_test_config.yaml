@@ -3,8 +3,8 @@
 # 부하 테스트 설정
 enable_ramp_up: true         # Ramp-up 테스트 활성화 여부 (true/false)
 enable_hold: true            # Hold 테스트 활성화 여부 (true/false)
-ramp_up_duration: 60.0       # Ramp-up 시간 (초) - 동시 사용자 수를 점진적으로 증가시키는 시간
-hold_duration: 300.0         # 최대 부하 유지 시간 (초) - 최대 동시 사용자 수로 유지하는 시간
+ramp_up_duration: 30.0       # Ramp-up 시간 (초) - 동시 사용자 수를 점진적으로 증가시키는 시간
+hold_duration: 5.0         # 최대 부하 유지 시간 (초) - 최대 동시 사용자 수로 유지하는 시간
 max_concurrent_users: 15     # 최대 동시 사용자 수
 ramp_up_steps: 5             # Ramp-up 단계 수 (동시 사용자 수를 몇 단계로 나눌지)
 warmup_requests: 5           # Warm-up 요청 수
