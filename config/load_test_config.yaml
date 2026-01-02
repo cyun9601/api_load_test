@@ -1,0 +1,37 @@
+# STT 모델 부하 테스트 설정 파일
+
+# 부하 테스트 설정
+enable_ramp_up: true         # Ramp-up 테스트 활성화 여부 (true/false)
+enable_hold: true            # Hold 테스트 활성화 여부 (true/false)
+ramp_up_duration: 60.0       # Ramp-up 시간 (초) - 동시 사용자 수를 점진적으로 증가시키는 시간
+hold_duration: 300.0         # 최대 부하 유지 시간 (초) - 최대 동시 사용자 수로 유지하는 시간
+max_concurrent_users: 15     # 최대 동시 사용자 수
+ramp_up_steps: 5             # Ramp-up 단계 수 (동시 사용자 수를 몇 단계로 나눌지)
+warmup_requests: 5           # Warm-up 요청 수
+request_delay: 0.0           # 요청 간 지연 시간 (초)
+
+# 오디오 설정
+use_random_audio: false      # 랜덤으로 오디오 생성 여부 (true: 랜덤 생성, false: resource 폴더 사용)
+save_audio_samples: false    # 랜덤으로 생성된 음성 파일 저장 여부 (true/false)
+
+# 랜덤 오디오 생성 설정 (use_random_audio가 true일 때만 사용)
+random_audio:
+  audio_duration: 10.0       # 생성할 오디오 길이 (초)
+  sample_rate: 16000         # 오디오 샘플링 레이트 (Hz)
+
+# Resource 폴더 설정 (use_random_audio가 false일 때 사용)
+resource:
+  base_path: "resource"      # resource 폴더 경로
+  warmup_folder: "warm_up"   # warm-up용 오디오 파일 폴더
+  test_folder: "test"        # 성능 테스트용 오디오 파일 폴더
+  add_noise: true           # 노이즈 추가 여부 (캐시 우회용, WAV 파일만 지원)
+  noise_level: 0.05          # 노이즈 레벨 (0.0 ~ 1.0, 기본값 0.01 = 1%)
+
+# API 설정
+api:
+  base_url: "http://192.168.73.172:32760"
+  endpoint: "/v1/audio/transcriptions"
+
+# 결과 저장 설정
+save_path: null              # 결과 저장 경로 (null이면 자동 생성)
+

@@ -166,12 +166,18 @@ async def main():
             print("❌ 오류: Test 폴더에 오디오 파일이 없습니다.")
             return
         
+        # Resource 폴더 노이즈 설정
+        add_noise = resource_config.get("add_noise", False)
+        noise_level = resource_config.get("noise_level", 0.01)
+        
         # Resource 폴더에서 파일 읽기 함수 생성
         audio_generator = create_resource_audio_generator(
             warmup_audio_files=warmup_audio_files,
             test_audio_files=test_audio_files,
             warmup_folder_path=warmup_folder_path,
-            test_folder_path=test_folder_path
+            test_folder_path=test_folder_path,
+            add_noise=add_noise,
+            noise_level=noise_level
         )
     
     print(f"🌐 API 설정: {base_url}{endpoint}")

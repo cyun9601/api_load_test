@@ -20,6 +20,8 @@ resource:
   base_path: "resource"     # resource 폴더 경로
   warmup_folder: "warm_up"  # warm-up용 오디오 파일 폴더
   test_folder: "test"       # 성능 테스트용 오디오 파일 폴더
+  add_noise: false          # 노이즈 추가 여부 (캐시 우회용, WAV 파일만 지원)
+  noise_level: 0.01         # 노이즈 레벨 (0.0 ~ 1.0, 기본값 0.01 = 1%)
 
 # API 설정
 api:
