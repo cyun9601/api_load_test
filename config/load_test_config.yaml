@@ -31,6 +31,7 @@ resource:
 api:
   base_url: "http://192.168.73.172:32760"
   endpoint: "/v1/audio/transcriptions"
+  model: "1225"  # STT 모델 이름
 
 # 결과 저장 설정
 save_path: null              # 결과 저장 경로 (null이면 자동 생성)

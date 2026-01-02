@@ -10,8 +10,17 @@ from utils.config import load_config
 
 
 # HTTP STT API 호출 함수
-async def http_stt_call(audio_data: io.BytesIO, base_url: str, endpoint: str, filename: str = 'audio.wav'):
-    """HTTP STT API 호출"""
+async def http_stt_call(audio_data: io.BytesIO, base_url: str, endpoint: str, filename: str = 'audio.wav', model: str = '1225'):
+    """
+    HTTP STT API 호출
+    
+    Args:
+        audio_data: 오디오 데이터 (BytesIO)
+        base_url: API 기본 URL
+        endpoint: API 엔드포인트
+        filename: 파일명
+        model: STT 모델 이름
+    """
     import aiohttp
     
     url = f"{base_url}{endpoint}"
@@ -36,7 +45,7 @@ async def http_stt_call(audio_data: io.BytesIO, base_url: str, endpoint: str, fi
         data = aiohttp.FormData()
         # 바이트 데이터를 파일로 전송
         data.add_field('file', audio_bytes, filename=filename, content_type=content_type)
-        data.add_field('model', '1225')
+        data.add_field('model', model)
         # 언어 설정
         data.add_field('language', 'ko')
         
@@ -90,6 +99,7 @@ async def main():
     api_config = config.get("api", {})
     base_url = api_config.get("base_url")
     endpoint = api_config.get("endpoint")
+    model = api_config.get("model", "1225")  # 기본값: 1225
     
     if not base_url or not endpoint:
         print("❌ 오류: API 설정(base_url, endpoint)이 누락되었습니다. config/load_test_config.yaml을 확인해주세요.")
@@ -165,7 +175,7 @@ async def main():
     async def api_call_func(audio_data: io.BytesIO):
         """STT API 호출 함수"""
         filename = getattr(audio_data, 'filename', 'audio.wav')
-        return await http_stt_call(audio_data, base_url, endpoint, filename=filename)
+        return await http_stt_call(audio_data, base_url, endpoint, filename=filename, model=model)
     
     # 부하 테스터 생성 및 실행
     tester = STTLoadTester(

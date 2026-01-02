@@ -15,6 +15,7 @@ class TestResult:
     text: Optional[str] = None  # STT 예측 텍스트
     audio_duration: Optional[float] = None  # 오디오 길이 (초)
     rtf: Optional[float] = None  # Real-Time Factor (처리 시간 / 오디오 길이)
+    concurrent_users: Optional[int] = None  # 동시 사용자 수 (load test에서 사용)
 
 
 @dataclass

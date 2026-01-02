@@ -10,8 +10,17 @@ from utils.config import load_config
 
 
 # HTTP STT API 호출 함수
-async def http_stt_call(audio_data: io.BytesIO, base_url: str, endpoint: str, filename: str = 'audio.wav'):
-    """HTTP STT API 호출"""
+async def http_stt_call(audio_data: io.BytesIO, base_url: str, endpoint: str, filename: str = 'audio.wav', model: str = '1225'):
+    """
+    HTTP STT API 호출
+    
+    Args:
+        audio_data: 오디오 데이터 (BytesIO)
+        base_url: API 기본 URL
+        endpoint: API 엔드포인트
+        filename: 파일명
+        model: STT 모델 이름
+    """
     import aiohttp
     
     url = f"{base_url}{endpoint}"
@@ -36,12 +45,9 @@ async def http_stt_call(audio_data: io.BytesIO, base_url: str, endpoint: str, fi
         data = aiohttp.FormData()
         # 바이트 데이터를 파일로 전송
         data.add_field('file', audio_bytes, filename=filename, content_type=content_type)
-        data.add_field('model', '1225')
-        # data.add_field('model', 'openai/whisper-large-v3')
+        data.add_field('model', model)
         # 언어 설정
         data.add_field('language', 'ko')
-        # 필요시 추가 필드 (예: model 등)
-        # data.add_field('model', 'whisper-1')
         
         try:
             async with session.post(url, data=data) as response:
@@ -82,8 +88,10 @@ async def main():
     use_random_audio = config.get("use_random_audio", True)
     save_audio_samples = config.get("save_audio_samples", False)
     save_path = config.get("save_path", None)
-    base_url = config.get("api", {}).get("base_url", "http://192.168.73.172:8000")
-    endpoint = config.get("api", {}).get("endpoint", "/v1/audio/transcriptions")
+    api_config = config.get("api", {})
+    base_url = api_config.get("base_url", "http://192.168.73.172:8000")
+    endpoint = api_config.get("endpoint", "/v1/audio/transcriptions")
+    model = api_config.get("model", "1225")  # 기본값: 1225
     
     # 랜덤 오디오 설정 (use_random_audio가 true일 때만 사용)
     random_audio_config = config.get("random_audio", {})
@@ -188,7 +196,7 @@ async def main():
         """STT API 호출 함수 (시간 측정에 포함)"""
         # 파일명이 있으면 사용, 없으면 기본값 사용
         filename = getattr(audio_data, 'filename', 'audio.wav')
-        return await http_stt_call(audio_data, base_url, endpoint, filename=filename)
+        return await http_stt_call(audio_data, base_url, endpoint, filename=filename, model=model)
     
     # 테스터 생성 및 실행
     tester = STTLatencyTester(

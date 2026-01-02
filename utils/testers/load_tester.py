@@ -232,6 +232,8 @@ class STTLoadTester:
                         await asyncio.sleep(self.request_delay)
                     
                     result = await self._make_request(request_id, is_warmup=False)
+                    # 동시 사용자 수 정보 추가
+                    result.concurrent_users = concurrent_users
                     self.results.append(result)
                     phase_results.append(result)
         
@@ -534,8 +536,9 @@ class STTLoadTester:
                     "error": r.error,
                     "text": r.text,
                     "audio_duration": r.audio_duration,
-                    "rtf": r.rtf
-                }''
+                    "rtf": r.rtf,
+                    "concurrent_users": r.concurrent_users
+                }
                 for r in self.results
             ],
             "user_count_rtf_data": self.user_count_rtf_data
@@ -775,7 +778,7 @@ class STTLoadTester:
         print(f"📈 타임라인 그래프가 {filepath}에 저장되었습니다.")
     
     def save_histogram(self, filename: Optional[str] = None):
-        """응답 시간 및 RTF 히스토그램 저장"""
+        """응답 시간 및 RTF 히스토그램 저장 (동시 사용자 수별 색상 구분)"""
         successful_results = [r for r in self.results if r.success]
         if not successful_results:
             print("⚠️ 성공한 요청이 없어 히스토그램을 생성할 수 없습니다.")
@@ -793,50 +796,106 @@ class STTLoadTester:
         
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 12))
         
-        response_times = [r.response_time for r in successful_results]
-        rtf_values = [r.rtf for r in successful_results if r.rtf is not None]
+        # 동시 사용자 수별로 그룹화
+        user_groups: Dict[int, List[TestResult]] = {}
+        for result in successful_results:
+            user_count = result.concurrent_users if result.concurrent_users is not None else 0
+            if user_count not in user_groups:
+                user_groups[user_count] = []
+            user_groups[user_count].append(result)
+        
+        # 동시 사용자 수별 색상 맵 생성 (더 많은 사용자일수록 진한 색)
+        sorted_user_counts = sorted(user_groups.keys())
+        if sorted_user_counts:
+            max_users = max(sorted_user_counts)
+            min_users = min(sorted_user_counts)
+            user_range = max_users - min_users if max_users != min_users else 1
+            
+            # 색상 팔레트 (파란색 계열에서 빨간색 계열로)
+            colors = plt.cm.viridis(np.linspace(0, 1, len(sorted_user_counts)))
         
         # === 위쪽: 응답 시간 히스토그램 ===
-        if response_times:
-            ax1.hist(response_times, bins=50, edgecolor='black', alpha=0.6, color='steelblue')
-            avg_time = statistics.mean(response_times)
-            median_time = statistics.median(response_times)
+        all_response_times = [r.response_time for r in successful_results]
+        if all_response_times:
+            # 전체 범위로 bins 설정
+            min_time = min(all_response_times)
+            max_time = max(all_response_times)
+            bins = np.linspace(min_time, max_time, 50)
+            
+            # 각 동시 사용자 수별로 히스토그램 그리기
+            for idx, user_count in enumerate(sorted_user_counts):
+                group_results = user_groups[user_count]
+                group_times = [r.response_time for r in group_results]
+                if group_times:
+                    color = colors[idx] if len(sorted_user_counts) > 1 else 'steelblue'
+                    ax1.hist(
+                        group_times,
+                        bins=bins,
+                        edgecolor='black',
+                        alpha=0.6,
+                        color=color,
+                        label=f'{user_count} users ({len(group_results)} requests)',
+                        histtype='stepfilled'
+                    )
+            
+            # 전체 평균 및 중앙값 선
+            avg_time = statistics.mean(all_response_times)
+            median_time = statistics.median(all_response_times)
             ax1.axvline(avg_time, color='red', linestyle='--', linewidth=1.5, alpha=0.7,
-                       label=f'Average: {avg_time:.3f}s')
+                       label=f'Overall Avg: {avg_time:.3f}s')
             ax1.axvline(median_time, color='green', linestyle='--', linewidth=1.5, alpha=0.7,
-                       label=f'Median: {median_time:.3f}s')
+                       label=f'Overall Median: {median_time:.3f}s')
         
         ax1.set_xlabel('Response Time (seconds)', fontsize=12)
         ax1.set_ylabel('Frequency', fontsize=12)
-        ax1.set_title('Response Time Histogram (Load Test)', fontsize=13, fontweight='bold')
-        ax1.legend(fontsize=10)
+        ax1.set_title('Response Time Histogram by Concurrent Users (Load Test)', fontsize=13, fontweight='bold')
+        ax1.legend(fontsize=9, loc='upper right')
         ax1.grid(True, alpha=0.3)
         
         # === 아래쪽: RTF 히스토그램 ===
-        if rtf_values:
-            ax2.hist(rtf_values, bins=50, edgecolor='black', alpha=0.6, color='steelblue')
-            avg_rtf = statistics.mean(rtf_values)
-            median_rtf = statistics.median(rtf_values)
+        rtf_results = [r for r in successful_results if r.rtf is not None]
+        if rtf_results:
+            all_rtf_values = [r.rtf for r in rtf_results]
+            min_rtf = min(all_rtf_values)
+            max_rtf = max(all_rtf_values)
+            rtf_range = max_rtf - min_rtf
+            bins_rtf = np.linspace(min_rtf, max_rtf, 50) if rtf_range > 0 else 50
+            
+            # 각 동시 사용자 수별로 RTF 히스토그램 그리기
+            for idx, user_count in enumerate(sorted_user_counts):
+                group_results = [r for r in user_groups[user_count] if r.rtf is not None]
+                group_rtf = [r.rtf for r in group_results]
+                if group_rtf:
+                    color = colors[idx] if len(sorted_user_counts) > 1 else 'steelblue'
+                    ax2.hist(
+                        group_rtf,
+                        bins=bins_rtf,
+                        edgecolor='black',
+                        alpha=0.6,
+                        color=color,
+                        label=f'{user_count} users ({len(group_results)} requests)',
+                        histtype='stepfilled'
+                    )
+            
+            # 전체 평균 및 중앙값 선
+            avg_rtf = statistics.mean(all_rtf_values)
+            median_rtf = statistics.median(all_rtf_values)
             ax2.axvline(avg_rtf, color='red', linestyle='--', linewidth=1.5, alpha=0.7,
-                       label=f'Average RTF: {avg_rtf:.3f}')
+                       label=f'Overall Avg RTF: {avg_rtf:.3f}')
             ax2.axvline(median_rtf, color='green', linestyle='--', linewidth=1.5, alpha=0.7,
-                       label=f'Median RTF: {median_rtf:.3f}')
+                       label=f'Overall Median RTF: {median_rtf:.3f}')
             
             # x축 범위를 데이터에 맞게 동적으로 조정
-            min_rtf = min(rtf_values)
-            max_rtf = max(rtf_values)
-            rtf_range = max_rtf - min_rtf
             if rtf_range > 0:
                 x_margin = rtf_range * 0.1
                 ax2.set_xlim(max(0, min_rtf - x_margin), max_rtf + x_margin)
             else:
-                # 범위가 0인 경우 (모든 값이 같음) 약간의 여유 공간 추가
                 ax2.set_xlim(max(0, min_rtf - 0.1), max_rtf + 0.1)
         
         ax2.set_xlabel('RTF (Real-Time Factor)', fontsize=12)
         ax2.set_ylabel('Frequency', fontsize=12)
-        ax2.set_title('RTF Histogram (Load Test)', fontsize=13, fontweight='bold')
-        ax2.legend(fontsize=10)
+        ax2.set_title('RTF Histogram by Concurrent Users (Load Test)', fontsize=13, fontweight='bold')
+        ax2.legend(fontsize=9, loc='upper right')
         ax2.grid(True, alpha=0.3)
         
         plt.tight_layout()
