@@ -23,7 +23,7 @@ resource:
 
 # API 설정
 api:
-  base_url: "http://192.168.73.172:31016"
+  base_url: "http://192.168.73.172:32760"
   endpoint: "/v1/audio/transcriptions"
 
 # 결과 저장 설정
