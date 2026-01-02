@@ -28,3 +28,4 @@ api:
 
 # 결과 저장 설정
 save_path: null             # 결과 저장 경로 (null이면 자동 생성)
+
