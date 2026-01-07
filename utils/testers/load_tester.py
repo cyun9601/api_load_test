@@ -74,7 +74,7 @@ class STTLoadTester:
         self.audio_duration: Optional[float] = audio_duration
         self.request_counter: int = 0  # 요청 카운터
         self.start_time: Optional[float] = None  # 테스트 시작 시간
-        self.user_count_rtf_data: List[Dict] = []  # 동시 사용자 수별 RTF 데이터 [{user_count, avg_rtf, ...}]
+        self.user_count_rtf_data: List[Dict] = []  # 동시 사용자 수별 RTF 및 Throughput 데이터 [{user_count, avg_rtf, ...}]
         self.vllm_metrics_collector: Optional[VLLMMetricsCollector] = None  # vLLM 메트릭 수집기
     
     def _save_audio_sample(self, audio_data: io.BytesIO, request_type: str, request_id: int):
@@ -221,7 +221,8 @@ class STTLoadTester:
     ):
         """지속적인 부하 생성"""
         semaphore = asyncio.Semaphore(concurrent_users)
-        end_time = time.time() + duration
+        start_time = time.time()
+        end_time = start_time + duration
         active_tasks = set()
         
         # 현재 단계의 결과를 저장할 리스트
@@ -247,13 +248,18 @@ class STTLoadTester:
         tasks = [continuous_request() for _ in range(concurrent_users)]
         await asyncio.gather(*tasks)
         
-        # 단계별 결과 분류 및 동시 사용자 수별 RTF 데이터 수집
+        # 실제 소요 시간 계산
+        actual_duration = time.time() - start_time
+        
+        # 단계별 결과 분류 및 동시 사용자 수별 RTF 및 Throughput 데이터 수집
         if phase_name.startswith("ramp_up"):
             self.ramp_up_results.extend(phase_results)
-            # 동시 사용자 수별 RTF 데이터 수집
+            # 동시 사용자 수별 RTF 및 Throughput 데이터 수집
             successful_phase_results = [r for r in phase_results if r.success and r.rtf is not None]
             if successful_phase_results:
                 rtf_values = [r.rtf for r in successful_phase_results]
+                # Throughput 계산 (요청/초)
+                throughput = len(successful_phase_results) / actual_duration if actual_duration > 0 else 0.0
                 self.user_count_rtf_data.append({
                     "user_count": concurrent_users,
                     "phase": phase_name,
@@ -261,7 +267,9 @@ class STTLoadTester:
                     "median_rtf": statistics.median(rtf_values),
                     "min_rtf": min(rtf_values),
                     "max_rtf": max(rtf_values),
-                    "request_count": len(successful_phase_results)
+                    "request_count": len(successful_phase_results),
+                    "duration": actual_duration,
+                    "throughput": throughput
                 })
         elif phase_name == "hold":
             self.hold_results.extend(phase_results)
@@ -269,6 +277,8 @@ class STTLoadTester:
             successful_phase_results = [r for r in phase_results if r.success and r.rtf is not None]
             if successful_phase_results:
                 rtf_values = [r.rtf for r in successful_phase_results]
+                # Throughput 계산 (요청/초)
+                throughput = len(successful_phase_results) / actual_duration if actual_duration > 0 else 0.0
                 self.user_count_rtf_data.append({
                     "user_count": concurrent_users,
                     "phase": "hold",
@@ -276,7 +286,9 @@ class STTLoadTester:
                     "median_rtf": statistics.median(rtf_values),
                     "min_rtf": min(rtf_values),
                     "max_rtf": max(rtf_values),
-                    "request_count": len(successful_phase_results)
+                    "request_count": len(successful_phase_results),
+                    "duration": actual_duration,
+                    "throughput": throughput
                 })
     
     async def run(self, enable_vllm_metrics: bool = False, vllm_base_url: Optional[str] = None, vllm_metrics_interval: float = 1.0) -> PerformanceMetrics:
@@ -1168,7 +1180,7 @@ class STTLoadTester:
         print(f"📊 동시 사용자 수별 RTF 추이 그래프가 {filepath}에 저장되었습니다.")
     
     def save_user_count_combined_graph(self, has_ttft: bool = False, filename: Optional[str] = None):
-        """동시 사용자 수별 RTF 및 TTFT 추이 그래프 저장 (하나의 figure로 통합)"""
+        """동시 사용자 수별 RTF, Throughput 및 TTFT 추이 그래프 저장 (하나의 figure로 통합)"""
         if not self.user_count_rtf_data and not has_ttft:
             print("⚠️ RTF 및 TTFT 데이터가 없어 그래프를 생성할 수 없습니다.")
             return
@@ -1183,11 +1195,11 @@ class STTLoadTester:
         plt.rcParams['font.family'] = 'DejaVu Sans'
         plt.rcParams['axes.unicode_minus'] = False
         
-        # 서브플롯 개수 결정 (TTFT가 있으면 2개, 없으면 1개)
+        # 서브플롯 개수 결정 (TTFT가 있으면 3개: RTF, Throughput, TTFT / 없으면 2개: RTF, Throughput)
         if has_ttft:
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 12))
+            fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 16))
         else:
-            fig, ax1 = plt.subplots(1, 1, figsize=(14, 8))
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 12))
         
         # === 위쪽: RTF 그래프 ===
         if self.user_count_rtf_data:
@@ -1266,6 +1278,58 @@ class STTLoadTester:
                 else:
                     ax1.set_ylim(max(0, min_rtf - 0.1), max_rtf + 0.1)
         
+        # === 중간: Throughput 그래프 ===
+        if self.user_count_rtf_data:
+            # 데이터 준비
+            user_counts = [d["user_count"] for d in self.user_count_rtf_data]
+            throughputs = [d.get("throughput", 0.0) for d in self.user_count_rtf_data]
+            phases = [d["phase"] for d in self.user_count_rtf_data]
+            
+            # Ramp-up과 Hold 구분
+            ramp_up_indices = [i for i, phase in enumerate(phases) if phase.startswith("ramp_up")]
+            hold_indices = [i for i, phase in enumerate(phases) if phase == "hold"]
+            
+            # Ramp-up 단계 플롯
+            if ramp_up_indices:
+                ramp_up_users = [user_counts[i] for i in ramp_up_indices]
+                ramp_up_throughputs = [throughputs[i] for i in ramp_up_indices]
+                
+                # 평균 Throughput 선
+                ax2.plot(ramp_up_users, ramp_up_throughputs, 'o-', color='orange', linewidth=2.5, 
+                       markersize=10, label='Ramp-up Throughput', alpha=0.8)
+            
+            # Hold 단계 플롯
+            if hold_indices:
+                hold_users = [user_counts[i] for i in hold_indices]
+                hold_throughputs = [throughputs[i] for i in hold_indices]
+                
+                # 평균 Throughput 선
+                ax2.plot(hold_users, hold_throughputs, 'o-', color='steelblue', linewidth=2.5, 
+                       markersize=10, label='Hold Throughput', alpha=0.8)
+            
+            # 전체 평균선
+            if throughputs:
+                overall_avg = statistics.mean(throughputs)
+                ax2.axhline(overall_avg, color='green', linestyle=':', linewidth=1.5, alpha=0.7,
+                          label=f'Overall Average Throughput: {overall_avg:.2f} req/s')
+            
+            ax2.set_xlabel('Concurrent Users', fontsize=12)
+            ax2.set_ylabel('Throughput (requests/second)', fontsize=12)
+            ax2.set_title('Throughput Trend by Concurrent Users', fontsize=13, fontweight='bold')
+            ax2.legend(fontsize=10, loc='best')
+            ax2.grid(True, alpha=0.3)
+            
+            # y축 범위를 데이터에 맞게 동적으로 조정
+            if throughputs:
+                min_throughput = min(throughputs)
+                max_throughput = max(throughputs)
+                throughput_range = max_throughput - min_throughput
+                if throughput_range > 0:
+                    y_margin = throughput_range * 0.1
+                    ax2.set_ylim(max(0, min_throughput - y_margin), max_throughput + y_margin)
+                else:
+                    ax2.set_ylim(max(0, min_throughput - 0.1), max_throughput + 0.1)
+        
         # === 아래쪽: TTFT 그래프 (TTFT 데이터가 있는 경우) ===
         if has_ttft:
             # 동시 사용자 수별로 그룹화 (Ramp-up과 Hold 구분)
@@ -1321,25 +1385,25 @@ class STTLoadTester:
             # Ramp-up 단계 플롯
             if ramp_up_sorted_users:
                 # 평균 TTFT 선
-                ax2.plot(ramp_up_sorted_users, ramp_up_avg_ttfts, 'o-', color='orange', linewidth=2.5, 
+                ax3.plot(ramp_up_sorted_users, ramp_up_avg_ttfts, 'o-', color='orange', linewidth=2.5, 
                        markersize=10, label='Ramp-up Average TTFT', alpha=0.8)
                 # 중앙값 TTFT 선
-                ax2.plot(ramp_up_sorted_users, ramp_up_median_ttfts, 's--', color='orange', linewidth=2, 
+                ax3.plot(ramp_up_sorted_users, ramp_up_median_ttfts, 's--', color='orange', linewidth=2, 
                        markersize=8, label='Ramp-up Median TTFT', alpha=0.7)
                 # Min-Max 범위
-                ax2.fill_between(ramp_up_sorted_users, ramp_up_min_ttfts, ramp_up_max_ttfts, 
+                ax3.fill_between(ramp_up_sorted_users, ramp_up_min_ttfts, ramp_up_max_ttfts, 
                                alpha=0.2, color='orange', label='Ramp-up Min-Max Range')
             
             # Hold 단계 플롯
             if hold_sorted_users:
                 # 평균 TTFT 선
-                ax2.plot(hold_sorted_users, hold_avg_ttfts, 'o-', color='steelblue', linewidth=2.5, 
+                ax3.plot(hold_sorted_users, hold_avg_ttfts, 'o-', color='steelblue', linewidth=2.5, 
                        markersize=10, label='Hold Average TTFT', alpha=0.8)
                 # 중앙값 TTFT 선
-                ax2.plot(hold_sorted_users, hold_median_ttfts, 's--', color='steelblue', linewidth=2, 
+                ax3.plot(hold_sorted_users, hold_median_ttfts, 's--', color='steelblue', linewidth=2, 
                        markersize=8, label='Hold Median TTFT', alpha=0.7)
                 # Min-Max 범위
-                ax2.fill_between(hold_sorted_users, hold_min_ttfts, hold_max_ttfts, 
+                ax3.fill_between(hold_sorted_users, hold_min_ttfts, hold_max_ttfts, 
                                alpha=0.2, color='steelblue', label='Hold Min-Max Range')
             
             # 전체 평균선
@@ -1351,14 +1415,14 @@ class STTLoadTester:
             
             if all_ttft_values:
                 overall_avg = statistics.mean(all_ttft_values)
-                ax2.axhline(overall_avg, color='green', linestyle=':', linewidth=1.5, alpha=0.7,
+                ax3.axhline(overall_avg, color='green', linestyle=':', linewidth=1.5, alpha=0.7,
                           label=f'Overall Average TTFT: {overall_avg:.3f}s')
             
-            ax2.set_xlabel('Concurrent Users', fontsize=12)
-            ax2.set_ylabel('TTFT (Time to First Token) (seconds)', fontsize=12)
-            ax2.set_title('TTFT Trend by Concurrent Users', fontsize=13, fontweight='bold')
-            ax2.legend(fontsize=10, loc='best')
-            ax2.grid(True, alpha=0.3)
+            ax3.set_xlabel('Concurrent Users', fontsize=12)
+            ax3.set_ylabel('TTFT (Time to First Token) (seconds)', fontsize=12)
+            ax3.set_title('TTFT Trend by Concurrent Users', fontsize=13, fontweight='bold')
+            ax3.legend(fontsize=10, loc='best')
+            ax3.grid(True, alpha=0.3)
             
             # y축 범위를 데이터에 맞게 동적으로 조정
             all_min_ttfts = ramp_up_min_ttfts + hold_min_ttfts
@@ -1369,9 +1433,9 @@ class STTLoadTester:
                 ttft_range = max_ttft - min_ttft
                 if ttft_range > 0:
                     y_margin = ttft_range * 0.1
-                    ax2.set_ylim(max(0, min_ttft - y_margin), max_ttft + y_margin)
+                    ax3.set_ylim(max(0, min_ttft - y_margin), max_ttft + y_margin)
                 else:
-                    ax2.set_ylim(max(0, min_ttft - 0.1), max_ttft + 0.1)
+                    ax3.set_ylim(max(0, min_ttft - 0.1), max_ttft + 0.1)
         
         plt.tight_layout()
         plt.savefig(filepath, dpi=300, bbox_inches='tight')
